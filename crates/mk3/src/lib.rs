@@ -13,6 +13,7 @@
 
 pub mod display;
 pub mod leds;
+pub mod mikro;
 
 /// Native Instruments' USB vendor id.
 pub const VENDOR: u16 = 0x17cc;
