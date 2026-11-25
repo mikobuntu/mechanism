@@ -301,6 +301,41 @@ pub struct Mk3Io {
     display_wake: Arc<std::sync::Condvar>,
 }
 
+enum Controller {
+    Mk3(deckard_mk3::Device),
+    Mikro(deckard_mk3::mikro::Device),
+}
+
+impl Controller {
+    fn open() -> Result<Self, String> {
+        match deckard_mk3::Device::open() {
+            Ok(device) => Ok(Self::Mk3(device)),
+            Err(full_error) => deckard_mk3::mikro::Device::open().map(Self::Mikro).map_err(|_| full_error),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Mk3(device) => device.model().name,
+            Self::Mikro(_) => "Maschine Mikro MK3",
+        }
+    }
+
+    fn full(&self) -> Option<&deckard_mk3::Device> {
+        match self {
+            Self::Mk3(device) => Some(device),
+            Self::Mikro(_) => None,
+        }
+    }
+
+    fn poll(&mut self, timeout_ms: i32, events: &mut Vec<Event>) -> Result<(), String> {
+        match self {
+            Self::Mk3(device) => device.poll(timeout_ms, events),
+            Self::Mikro(device) => device.poll(timeout_ms, events),
+        }
+    }
+}
+
 /// The pitch pads play: a sound's base key (Maschine's default, C3).
 const PAD_PITCH: i64 = 60;
 
@@ -501,7 +536,7 @@ impl Mk3Io {
 
 fn run(shared: &Mutex<Shared>) {
     loop {
-        let mut dev = match deckard_mk3::Device::open() {
+        let mut dev = match Controller::open() {
             Ok(d) => d,
             Err(e) => {
                 let mut s = shared.lock().unwrap();
@@ -513,7 +548,9 @@ fn run(shared: &Mutex<Shared>) {
             }
         };
         // Clear the preceding host/session before waiting for the first UI state.
-        if let Err(e) = dev.write_leds(&deckard_mk3::leds::Leds::default()) {
+        if let Some(full) = dev.full()
+            && let Err(e) = full.write_leds(&deckard_mk3::leds::Leds::default())
+        {
             let mut s = shared.lock().unwrap();
             s.status = format!("Maschine MK3: {e}");
             s.probed = true;
@@ -524,7 +561,7 @@ fn run(shared: &Mutex<Shared>) {
         let _polling = crate::controller_timing::Polling::start();
         {
             let mut s = shared.lock().unwrap();
-            s.status = format!("{} connected", dev.model().name);
+            s.status = format!("{} connected", dev.name());
             s.connected = true;
             s.probed = true;
         }
@@ -550,7 +587,9 @@ fn run(shared: &Mutex<Shared>) {
         let mut touching = Touching::default();
         loop {
             if shared.lock().unwrap().closing {
-                let _ = dev.write_leds(&deckard_mk3::leds::Leds::default());
+                if let Some(full) = dev.full() {
+                    let _ = full.write_leds(&deckard_mk3::leds::Leds::default());
+                }
                 shared.lock().unwrap().leds_closed = true;
                 return;
             }
@@ -665,8 +704,9 @@ fn run(shared: &Mutex<Shared>) {
             if let Some(level) = wanted
                 && stamp != applied_stamp
                 && Instant::now() >= brightness_retry
+                && let Some(full) = dev.full()
             {
-                match dev.set_display_brightness(level) {
+                match full.set_display_brightness(level) {
                     Ok(()) => applied_stamp = stamp,
                     Err(e) => {
                         shared.lock().unwrap().display_status = format!("display brightness: {e}");
@@ -681,8 +721,9 @@ fn run(shared: &Mutex<Shared>) {
             if let Some(level) = wanted_leds
                 && led_stamp != applied_led_stamp
                 && Instant::now() >= led_retry
+                && let Some(full) = dev.full()
             {
-                match dev.set_led_brightness(level) {
+                match full.set_led_brightness(level) {
                     Ok(()) => applied_led_stamp = led_stamp,
                     Err(e) => {
                         shared.lock().unwrap().status = format!("LED brightness: {e}");
@@ -697,8 +738,9 @@ fn run(shared: &Mutex<Shared>) {
             if let Some(level) = wanted_sensitivity
                 && sensitivity_stamp != applied_sensitivity_stamp
                 && Instant::now() >= sensitivity_retry
+                && let Some(full) = dev.full()
             {
-                match dev.set_pad_sensitivity(level) {
+                match full.set_pad_sensitivity(level) {
                     Ok(()) => applied_sensitivity_stamp = sensitivity_stamp,
                     Err(e) => {
                         shared.lock().unwrap().status = format!("pad sensitivity: {e}");
@@ -717,7 +759,8 @@ fn run(shared: &Mutex<Shared>) {
             };
             if leds.is_some() && leds != shown {
                 if let Some(l) = &leds
-                    && let Err(e) = dev.write_leds(l)
+                    && let Some(full) = dev.full()
+                    && let Err(e) = full.write_leds(l)
                 {
                     let mut s = shared.lock().unwrap();
                     s.status = format!("Maschine MK3: {e}");

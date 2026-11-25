@@ -15,7 +15,8 @@ fn main() {
             match event {
                 Event::Button(name, pressed) => println!("button {name} {}", if pressed { "down" } else { "up" }),
                 Event::Wheel(steps) => println!("wheel {steps:+}"),
-                Event::Slider(position) => println!("slider {position:.3}"),
+                Event::Knob(index, amount) => println!("knob {} {amount:+.3}", index + 1),
+                Event::Touch(_, kind, position) => println!("slider kind {kind} position {position:.3}"),
                 Event::PadOn(pad, pressure) => println!("pad {pad} down pressure {pressure:.3}"),
                 Event::PadPressure(pad, pressure) => println!("pad {pad} pressure {pressure:.3}"),
                 Event::PadOff(pad) => println!("pad {pad} up"),

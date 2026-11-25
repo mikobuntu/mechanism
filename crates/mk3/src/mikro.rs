@@ -5,60 +5,52 @@
 
 use hidapi::{HidApi, HidDevice};
 
+pub use crate::Event;
+
 pub const PRODUCT: u16 = 0x1700;
 
 pub const BUTTONS: &[(usize, &str)] = &[
-    (0, "MASCHINE"),
-    (1, "FAVORITES"),
-    (2, "BROWSER"),
-    (3, "VOLUME"),
-    (4, "SWING"),
-    (5, "TEMPO"),
-    (6, "PLUGIN"),
-    (7, "SAMPLING"),
-    (8, "LEFT"),
-    (9, "RIGHT"),
-    (10, "PITCH"),
-    (11, "MOD"),
-    (12, "PERFORM"),
-    (13, "NOTES"),
-    (14, "GROUP"),
-    (15, "AUTO"),
-    (16, "LOCK"),
-    (17, "NOTE_REPEAT"),
-    (18, "RESTART"),
-    (19, "ERASE"),
-    (20, "TAP"),
-    (21, "FOLLOW"),
-    (22, "PLAY"),
-    (23, "REC"),
-    (24, "STOP"),
-    (25, "SHIFT"),
-    (26, "FIXED_VEL"),
-    (27, "PAD_MODE"),
-    (28, "KEYBOARD"),
-    (29, "CHORDS"),
-    (30, "STEP"),
-    (31, "SCENE"),
-    (32, "PATTERN"),
-    (33, "EVENTS"),
-    (34, "VARIATION"),
-    (35, "DUPLICATE"),
-    (36, "SELECT"),
-    (37, "SOLO"),
-    (38, "MUTE"),
-    (39, "WHEEL"),
+    (0, "BUTTON_MASCHINE"),
+    (1, "BUTTON_FAVORITES"),
+    (2, "BUTTON_BROWSE"),
+    (3, "BUTTON_VOLUME"),
+    (4, "BUTTON_SWING"),
+    (5, "BUTTON_TEMPO"),
+    (6, "BUTTON_PLUGIN"),
+    (7, "BUTTON_SAMPLE"),
+    (8, "BUTTON_LEFT"),
+    (9, "BUTTON_RIGHT"),
+    (10, "BUTTON_PITCH"),
+    (11, "BUTTON_MOD"),
+    (12, "BUTTON_PERFORM"),
+    (13, "BUTTON_NOTES"),
+    (14, "BUTTON_GROUP"),
+    (15, "BUTTON_AUTO"),
+    (16, "BUTTON_LOCK"),
+    (17, "BUTTON_NOTE_REPEAT"),
+    (18, "BUTTON_TRANSPORT_LOOP"),
+    (19, "BUTTON_TRANSPORT_ERASE"),
+    (20, "BUTTON_TAP"),
+    (21, "BUTTON_FOLLOW"),
+    (22, "BUTTON_TRANSPORT_PLAY"),
+    (23, "BUTTON_TRANSPORT_RECORD"),
+    (24, "BUTTON_TRANSPORT_STOP"),
+    (25, "BUTTON_SHIFT"),
+    (26, "BUTTON_FIX_VELOCITY"),
+    (27, "BUTTON_PAD_MODE"),
+    (28, "BUTTON_KEYBOARD"),
+    (29, "BUTTON_CHORDS"),
+    (30, "BUTTON_STEP"),
+    (31, "BUTTON_SCENE"),
+    (32, "BUTTON_PATTERN"),
+    (33, "BUTTON_EVENTS"),
+    (34, "BUTTON_VARIATION"),
+    (35, "BUTTON_DUPLICATE"),
+    (36, "BUTTON_SELECT"),
+    (37, "BUTTON_SOLO"),
+    (38, "BUTTON_MUTE"),
+    (39, "BUTTON_WHEEL"),
 ];
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Event {
-    Button(&'static str, bool),
-    Wheel(i32),
-    Slider(f64),
-    PadOn(usize, f64),
-    PadPressure(usize, f64),
-    PadOff(usize),
-}
 
 #[derive(Default)]
 pub struct Decoder {
@@ -102,7 +94,13 @@ impl Decoder {
 
         let slider = r[10].min(200);
         if self.slider.is_some_and(|old| old != slider) {
-            out.push(Event::Slider(f64::from(slider) / 200.0));
+            let old = self.slider.unwrap_or(0);
+            let kind = match (old == 0, slider == 0) {
+                (true, false) => 0,
+                (false, true) => 2,
+                _ => 1,
+            };
+            out.push(Event::Touch(0, kind, f64::from(slider) / 200.0));
         }
         self.slider = Some(slider);
     }
@@ -170,7 +168,7 @@ mod tests {
         let mut events = Vec::new();
         decoder.decode(&controls([0, 0, 0, 0, 0], 0, 0), &mut events);
         decoder.decode(&controls([0, 4, 0, 0, 0], 1, 100), &mut events);
-        assert_eq!(events, vec![Event::Button("PITCH", true), Event::Wheel(1), Event::Slider(0.5)]);
+        assert_eq!(events, vec![Event::Button("BUTTON_PITCH", true), Event::Wheel(1), Event::Touch(0, 0, 0.5)]);
     }
 
     #[test]
