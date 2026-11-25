@@ -52,6 +52,48 @@ pub const BUTTONS: &[(usize, &str)] = &[
     (39, "BUTTON_WHEEL"),
 ];
 
+const LED_BUTTONS: [Option<&str>; 39] = [
+    None,
+    None,
+    Some("LED_BROWSE"),
+    Some("LED_VOLUME"),
+    Some("LED_SWING"),
+    Some("LED_TEMPO"),
+    Some("LED_PLUGIN"),
+    None,
+    Some("LED_LEFT"),
+    Some("LED_RIGHT"),
+    Some("LED_PITCH"),
+    Some("LED_MOD"),
+    Some("LED_PERFORM"),
+    Some("LED_NOTES"),
+    None,
+    Some("LED_AUTO_WRITE"),
+    Some("LED_LOCK"),
+    Some("LED_NOTE_REPEAT"),
+    Some("LED_TRANSPORT_LOOP"),
+    Some("LED_TRANSPORT_ERASE"),
+    Some("LED_TAP"),
+    Some("LED_FOLLOW"),
+    Some("LED_TRANSPORT_PLAY"),
+    Some("LED_TRANSPORT_RECORD"),
+    Some("LED_TRANSPORT_STOP"),
+    Some("LED_SHIFT"),
+    Some("LED_FIX_VELOCITY"),
+    Some("LED_PAD_MODE"),
+    Some("LED_KEYBOARD"),
+    Some("LED_CHORDS"),
+    Some("LED_STEP"),
+    Some("LED_SCENE"),
+    Some("LED_PATTERN"),
+    None,
+    Some("LED_VARIATION"),
+    Some("LED_DUPLICATE"),
+    Some("LED_SELECT"),
+    Some("LED_SOLO"),
+    Some("LED_MUTE"),
+];
+
 #[derive(Default)]
 pub struct Decoder {
     buttons: [u8; 5],
@@ -152,6 +194,35 @@ impl Device {
         }
         Ok(())
     }
+
+    /// Send the existing DECKARD LED state in the Mikro's 0x80 layout.
+    pub fn write_leds(&self, leds: &crate::leds::Leds) -> Result<(), String> {
+        let mut report = [0u8; 81];
+        report[0] = 0x80;
+        for (index, name) in LED_BUTTONS.into_iter().enumerate() {
+            report[1 + index] = name.and_then(|name| leds.get(name)).map(mikro_button_led).unwrap_or(0);
+        }
+        for index in 0..16 {
+            let pad = pad_number(index as u8);
+            report[1 + 39 + index] = leds.get(&format!("LED_PAD_{pad}")).unwrap_or(0);
+        }
+        for index in 0..25 {
+            report[1 + 55 + index] = leds.get(&format!("LED_TS_{:02}", index + 1)).map(mikro_colour_led).unwrap_or(0);
+        }
+        self.hid.write(&report).map(|_| ()).map_err(|e| e.to_string())
+    }
+}
+
+fn mikro_button_led(value: u8) -> u8 {
+    match value {
+        0 => 0,
+        0x7f => 0x7e,
+        _ => 0x7c,
+    }
+}
+
+fn mikro_colour_led(value: u8) -> u8 {
+    u8::from(value != 0) * 0x7e
 }
 
 #[cfg(test)]
@@ -175,5 +246,21 @@ mod tests {
     fn maps_bottom_left_pad_to_one() {
         assert_eq!(pad_number(12), 1);
         assert_eq!(pad_number(3), 16);
+    }
+
+    #[test]
+    fn maps_full_mk3_led_names_to_mikro_layout() {
+        assert_eq!(LED_BUTTONS[22], Some("LED_TRANSPORT_PLAY"));
+        assert_eq!(pad_number(0), 13);
+        assert_eq!(pad_number(12), 1);
+    }
+
+    #[test]
+    fn converts_full_mk3_button_levels_to_mikro_levels() {
+        assert_eq!(mikro_button_led(0), 0);
+        assert_eq!(mikro_button_led(crate::leds::BACKLIGHT), 0x7c);
+        assert_eq!(mikro_button_led(crate::leds::ON), 0x7e);
+        assert_eq!(mikro_colour_led(0), 0);
+        assert_eq!(mikro_colour_led(1), 0x7e);
     }
 }

@@ -328,6 +328,13 @@ impl Controller {
         }
     }
 
+    fn write_leds(&self, leds: &deckard_mk3::leds::Leds) -> Result<(), String> {
+        match self {
+            Self::Mk3(device) => device.write_leds(leds),
+            Self::Mikro(device) => device.write_leds(leds),
+        }
+    }
+
     fn poll(&mut self, timeout_ms: i32, events: &mut Vec<Event>) -> Result<(), String> {
         match self {
             Self::Mk3(device) => device.poll(timeout_ms, events),
@@ -548,9 +555,7 @@ fn run(shared: &Mutex<Shared>) {
             }
         };
         // Clear the preceding host/session before waiting for the first UI state.
-        if let Some(full) = dev.full()
-            && let Err(e) = full.write_leds(&deckard_mk3::leds::Leds::default())
-        {
+        if let Err(e) = dev.write_leds(&deckard_mk3::leds::Leds::default()) {
             let mut s = shared.lock().unwrap();
             s.status = format!("Maschine MK3: {e}");
             s.probed = true;
@@ -587,9 +592,7 @@ fn run(shared: &Mutex<Shared>) {
         let mut touching = Touching::default();
         loop {
             if shared.lock().unwrap().closing {
-                if let Some(full) = dev.full() {
-                    let _ = full.write_leds(&deckard_mk3::leds::Leds::default());
-                }
+                let _ = dev.write_leds(&deckard_mk3::leds::Leds::default());
                 shared.lock().unwrap().leds_closed = true;
                 return;
             }
@@ -759,8 +762,7 @@ fn run(shared: &Mutex<Shared>) {
             };
             if leds.is_some() && leds != shown {
                 if let Some(l) = &leds
-                    && let Some(full) = dev.full()
-                    && let Err(e) = full.write_leds(l)
+                    && let Err(e) = dev.write_leds(l)
                 {
                     let mut s = shared.lock().unwrap();
                     s.status = format!("Maschine MK3: {e}");

@@ -33,6 +33,15 @@ hardware. `MODELS` in `crates/mk3/src/lib.rs` has each controller's ids.
 Button bits: 0 encoder push, 2–5 encoder up/right/down/left, 6 SHIFT, 7 display button 8
 (verify), 8–15 groups A–H, 16 NOTES, 17 VOLUME, 18 SWING, 19 TEMPO, 20 NOTE REPEAT,
 21 LOCK, 24 PAD MODE, 25 KEYBOARD, 26 CHORDS, 27 STEP, 28 FIXED VEL, 29 SCENE,
+
+## Maschine Mikro MK3
+
+The Mikro uses VID 0x17CC, PID 0x1700 and a separate HID layout. Its input decoder and
+output path live in `crates/mk3/src/mikro.rs`; the viewer routes it through the same
+controller-script events as the full MK3. Output report `0x80` is 81 bytes including the
+report id: 39 button LED values, 16 pad LED values in HID pad-index order, and 25 touch-strip
+LED values. Button values are `0x7c` for backlight and `0x7e` for lit; pad and strip values
+are passed through from the script LED state. The Mikro has no full-MK3 displays.
 30 PATTERN, 31 EVENTS, 33 VARIATION, 34 DUPLICATE, 35 SELECT, 36 SOLO, 37 MUTE,
 38 PITCH, 39 MOD, 40 PERFORM, 41 RESTART, 42 ERASE, 43 TAP, 44 FOLLOW, 45 PLAY, 46 REC,
 47 STOP, 48 MACRO, 49 SETTINGS, 50 page right, 51 SAMPLING, 52 MIXER, 53 PLUG-IN,
