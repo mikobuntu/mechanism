@@ -118,44 +118,86 @@ impl Browser {
                         return;
                     }
                 };
+                let reply = |lib: &mut Library, n: u64, mut q: Query| -> bool {
+                    let mut r = lib.query(&q);
+                    let product = if let Some(want) = &q.product
+                        && !r.products.contains(want)
+                    {
+                        let next = r.products.iter().find(|p| p.eq_ignore_ascii_case(want)).cloned();
+                        if next.is_none() {
+                            q.bank.clear();
+                        }
+                        q.product = next.clone();
+                        r = lib.query(&q);
+                        Some(next)
+                    } else {
+                        None
+                    };
+                    tx.send((n, r, lib.ni_error.clone(), product)).is_ok()
+                };
+                // The last query answered. A folder walk that arrives on its own runs
+                // after it, then this query runs again so the new files show up.
+                let mut last: Option<(u64, Query)> = None;
                 while let Ok(mut job) = rx.recv() {
-                    // Only the newest of the queries waiting.
-                    while let Job::Query(..) = job {
-                        match rx.try_recv() {
-                            Ok(next @ Job::Query(..)) => job = next,
-                            Ok(other) => {
+                    loop {
+                        let (current, first, later) = split_query(job, &rx);
+                        if let Job::Query(n, q) = current {
+                            for other in first {
                                 run(&mut lib, other);
                             }
-                            Err(_) => break,
-                        }
-                    }
-                    if let Job::Query(n, mut q) = job {
-                        let mut r = lib.query(&q);
-                        let product = if let Some(want) = &q.product
-                            && !r.products.contains(want)
-                        {
-                            let next = r.products.iter().find(|p| p.eq_ignore_ascii_case(want)).cloned();
-                            if next.is_none() {
-                                q.bank.clear();
+                            last = Some((n, q.clone()));
+                            if !reply(&mut lib, n, q) {
+                                return;
                             }
-                            q.product = next.clone();
-                            r = lib.query(&q);
-                            Some(next)
+                            let again = !later.is_empty();
+                            for other in later {
+                                run(&mut lib, other);
+                            }
+                            if again {
+                                match rx.try_recv() {
+                                    Ok(next) => {
+                                        job = next;
+                                        continue;
+                                    }
+                                    Err(_) => {
+                                        if let Some((n, q)) = last.clone()
+                                            && !reply(&mut lib, n, q)
+                                        {
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
                         } else {
-                            None
-                        };
-                        if tx.send((n, r, lib.ni_error.clone(), product)).is_err() {
-                            return;
+                            let scanned = matches!(current, Job::Scan(_));
+                            run(&mut lib, current);
+                            if scanned {
+                                match rx.try_recv() {
+                                    Ok(next) => {
+                                        job = next;
+                                        continue;
+                                    }
+                                    Err(_) => {
+                                        if let Some((n, q)) = last.clone()
+                                            && !reply(&mut lib, n, q)
+                                        {
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
                         }
-                    } else {
-                        run(&mut lib, job);
+                        break;
                     }
                 }
             })
             .expect("a thread for the library");
         self.worker = Some((jobs, answers));
-        self.send(Job::Scan(roots));
+        // The index DECKARD already has, including NI's, answers before the folder
+        // walk. That walk is Maschine's user folders and any library folders, and it
+        // is what used to hold the installed expansions off the screen.
         self.refresh();
+        self.send(Job::Scan(roots));
     }
 
     pub fn started(&self) -> bool {
@@ -318,6 +360,25 @@ impl Browser {
     pub fn selected_item(&self) -> Option<&Item> {
         self.selected.and_then(|i| self.results.items.get(i))
     }
+}
+
+/// Keep the newest query, and sort the jobs queued with it into those to run before it
+/// is answered and those to hold until after. A scan queued in the same breath must not
+/// run first: it walks the user's folders, and the expansions are already in the index.
+/// Everything else is quick and belongs in the answer (a file just saved, a favourite
+/// just set), so it runs first.
+fn split_query(mut job: Job, rx: &mpsc::Receiver<Job>) -> (Job, Vec<Job>, Vec<Job>) {
+    let mut first = Vec::new();
+    let mut later = Vec::new();
+    while matches!(job, Job::Query(..)) {
+        match rx.try_recv() {
+            Ok(next @ Job::Query(..)) => job = next,
+            Ok(scan @ Job::Scan(_)) => later.push(scan),
+            Ok(other) => first.push(other),
+            Err(_) => break,
+        }
+    }
+    (job, first, later)
 }
 
 fn run(lib: &mut Library, job: Job) {
@@ -551,6 +612,38 @@ pub fn item_of(path: &Path) -> Option<Item> {
 #[cfg(test)]
 mod query_order_tests {
     use super::*;
+    /// A file saved (or a favourite set) just before a query is in that query's answer:
+    /// only the folder walk waits until after it.
+    #[test]
+    fn a_save_queued_before_a_query_runs_before_its_answer() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(Job::Query(1, Query::default())).unwrap();
+        tx.send(Job::Scan(Vec::new())).unwrap();
+        tx.send(Job::Saved("Hit.wav".into())).unwrap();
+        tx.send(Job::Favorite("k".into(), true)).unwrap();
+        tx.send(Job::Query(2, Query::default())).unwrap();
+        let (job, first, later) = split_query(rx.recv().unwrap(), &rx);
+        assert!(matches!(job, Job::Query(2, _)), "the newest query");
+        assert!(matches!(first.as_slice(), [Job::Saved(_), Job::Favorite(..)]), "run before the answer, in order");
+        assert!(matches!(later.as_slice(), [Job::Scan(_)]), "the walk waits");
+    }
+
+    #[test]
+    fn a_query_is_answered_before_a_scan_queued_behind_it() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(Job::Query(1, Query::default())).unwrap();
+        tx.send(Job::Scan(Vec::new())).unwrap();
+        tx.send(Job::Query(2, Query { text: "snare".into(), ..Query::default() })).unwrap();
+        let (job, first, later) = split_query(rx.recv().unwrap(), &rx);
+        match job {
+            Job::Query(2, q) => assert_eq!(q.text, "snare"),
+            _ => panic!("the newest query"),
+        }
+        assert!(first.is_empty());
+        assert!(matches!(later.as_slice(), [Job::Scan(_)]));
+        assert!(rx.try_recv().is_err());
+    }
+
     #[test]
     fn an_old_query_cannot_send_the_second_preset_back_to_the_first() {
         let items: Vec<_> = ["First", "Second", "Third"]

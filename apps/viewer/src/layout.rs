@@ -255,8 +255,21 @@ fn sound_base(app: &App, sound: usize) -> Color32 {
 
 /// The software window follows the desktop theme. The controller keeps its own.
 /// Maschine restores the ordinary dark window.
+/// The window's field and writing for a theme that has none of its own: the ordinary dark window.
+pub(crate) fn window_colours(theme: &str, mode: &str) -> ([u8; 3], [u8; 3]) {
+    desktop_look(theme, mode).unwrap_or(([0x18, 0x18, 0x18], [0xff, 0xff, 0xff]))
+}
+
+pub(crate) fn sync_desktop(ctx: &egui::Context, app: &App) {
+    sync_lcd(ctx, app);
+}
+
 fn sync_lcd(ctx: &egui::Context, app: &App) {
-    let Some((paper, ink)) = desktop_look(&app.settings.desktop_theme, &app.settings.lcd_mode) else {
+    let chosen = match (app.settings.desktop_background, app.settings.desktop_text) {
+        (Some(paper), Some(ink)) => Some((paper, ink)),
+        _ => desktop_look(&app.settings.desktop_theme, &app.settings.lcd_mode),
+    };
+    let Some((paper, ink)) = chosen else {
         LCD_PAPER.with(|c| c.set(None));
         LCD_INK.with(|c| c.set(None));
         DESK.with(|d| d.set(PLAIN));
@@ -6835,8 +6848,8 @@ fn group_panel(ui: &mut Ui, app: &App, p: &Project, rect: Rect, head: Option<Pla
         let row_h = grid.height() / count;
         (row_h, first * row_h)
     } else {
-        // The sound slots: a plain scroll bar.
-        let y0 = scroll(ui, "pattern-rows", grid, rows as f32 * ROW);
+        // The sound names and drum lanes share one offset and accept wheel input over either.
+        let y0 = scroll(ui, "pattern-rows", list.union(grid), rows as f32 * ROW);
         let total = rows as f32 * ROW;
         let y0 = match zoom_bar(
             ui,
@@ -7120,12 +7133,32 @@ fn group_panel(ui: &mut Ui, app: &App, p: &Project, rect: Rect, head: Option<Pla
     // Selected notes (and previews) are lit and framed: a white wash, a dark inner
     // line and a white outer one, as Maschine marks a selection.
     let marks = std::cell::RefCell::new(Vec::new());
+    let colour = |n: &Note| if deckard_doc::note_tools::muted(n) { grey(128) } else { sound_color(p, app.group, n.sound) };
+    let draw_tail = |n: &Note| {
+        let length = n.ratchet.loop_tail(n.position, n.length, start..end);
+        if length > 0
+            && let Some(mut r) = note_rect(&Note { position: start, length, ..*n })
+        {
+            r.max.x = r.max.x.min(x_of(end as f64));
+            gp.rect_filled(r, 1.0, with_alpha(colour(n), 68));
+        }
+    };
+    // The carried gate has no attack or hit target here. Draw it below real notes.
+    for n in &notes {
+        if !moving.iter().any(|(o, _)| o == *n) {
+            draw_tail(n);
+        }
+    }
+    for (_, n) in &moving {
+        draw_tail(n);
+    }
+    if let Some(NoteDrag::Paint { notes: ns }) = &drag {
+        ns.iter().for_each(draw_tail);
+    }
     let draw = |n: &Note, outline: Option<Color32>| {
         if let Some(r) = note_rect(n) {
             let a = 80 + (n.velocity.clamp(0, 127) * 175 / 127) as u8;
-            // Muted notes: Maschine's grey.
-            let c = if deckard_doc::note_tools::muted(n) { grey(128) } else { sound_color(p, app.group, n.sound) };
-            gp.rect_filled(r, 1.0, with_alpha(c, a));
+            gp.rect_filled(r, 1.0, with_alpha(colour(n), a));
             // A ratcheted note: a tick where each later hit starts.
             if !n.ratchet.is_plain() {
                 let hits = n.ratchet.hits(n.length, n.velocity);
@@ -8493,12 +8526,17 @@ mod header_icon_tests {
 
 #[cfg(test)]
 mod desktop_theme_tests {
-    /// Every controller theme DECKARD ships is offered as the desktop theme, so each
-    /// one but Maschine (the ordinary dark window) restyles the window.
+    /// The hand-written themes restyle the window, except Maschine, which is the
+    /// ordinary dark window. The stock palettes are controller themes; the desktop
+    /// combo does not offer them.
     #[test]
     fn every_shipped_theme_but_maschine_restyles_the_window() {
-        for t in deckard_surface::Surface::new().themes() {
-            assert_eq!(super::desktop_look(&t, "yellow").is_some(), t != "maschine", "{t}");
+        for t in ["lcd", "palenight", "palenight_blue_green", "solarized_dark"] {
+            assert!(super::desktop_look(t, "yellow").is_some(), "{t}");
+        }
+        assert!(super::desktop_look("maschine", "yellow").is_none());
+        for theme in deckard_surface::theme_file::stock() {
+            assert!(super::desktop_look(theme.id, "yellow").is_none(), "{}", theme.id);
         }
     }
 

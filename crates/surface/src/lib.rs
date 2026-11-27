@@ -24,6 +24,7 @@ mod leds;
 mod names;
 mod screen;
 mod sources;
+pub mod theme_file;
 pub mod widget;
 
 pub use screen::{FONTS, PICTURE_ALPHA, Picture};
@@ -36,6 +37,8 @@ pub struct View {
     pub tempo: f64,
     /// The song's swing, 0–100 %.
     pub swing: f64,
+    /// The focused sound's Variation settings, when there is a sound to show.
+    pub variation: Option<VariationView>,
     /// The master level as stored (0..1, 0.75 unity).
     pub master_volume: f64,
     /// The master level in dB (−∞ silent).
@@ -127,6 +130,13 @@ pub struct View {
     pub control: ControlView,
     /// The library as BROWSE shows it.
     pub browser: BrowserView,
+    /// The desktop library panel is open, so the strip is hidden: a script must not set
+    /// an edit nobody can see there (one that survives the panel closing).
+    pub browser_open: bool,
+    /// The controller page the app is showing (`control`, `step`, `song`…), as the MK3's
+    /// scripts leave it: the fact NI hands a device when the controller's page changes,
+    /// which is what closes a static OSO.
+    pub page: String,
     /// What the Sampling page (SAMPLE) shows.
     pub sampling: SamplingView,
     /// A group or sound is loading: the name, shown over both screens until it's in.
@@ -147,6 +157,14 @@ pub struct SamplingView {
     /// How many recordings have been taken, and the one focused.
     pub takes: usize,
     pub take: Option<usize>,
+    /// RECORD's LAYER was turned for the focused take, and APPLY hasn't put it there yet.
+    pub layer_pending: bool,
+    /// The focused sound's Sampler Preview mode (0 Original, 1 Advanced, 2 Layers); None:
+    /// it isn't one.
+    pub sampler: Option<u8>,
+    /// A mode asked for that waits for its confirmation (changing it loses the sound's
+    /// changes).
+    pub sampler_ask: Option<u8>,
     /// Each take's mini waveform: (min, max) columns.
     pub take_waves: Vec<std::sync::Arc<Vec<(f32, f32)>>>,
     /// A stem separation running.
@@ -436,6 +454,12 @@ pub struct SoundView {
     pub selected: bool,
     /// Its Audio plug-in's loop in the focused pattern (focused group only).
     pub audio: Option<LoopView>,
+    /// Its Audio plug-in plays in Loop mode (with the pattern, not with notes): in Pad
+    /// mode its pad switches the loop on or off ([`Action::ToggleAudioLoop`]).
+    pub loop_mode: bool,
+    /// A loop on this sound is active now (an enabled Loop-mode Audio plug-in in the
+    /// active pattern, or an unmuted looped Sampler / New Sampler voice playing).
+    pub loop_playing: bool,
 }
 
 /// A sound's Audio plug-in loop as the pattern editors draw it (Maschine's
@@ -519,6 +543,36 @@ pub struct MixView {
     pub swing: f64,
     /// Its Sampler's tune in semitones (a group: its first Sampler's), if it has one.
     pub tune: Option<f64>,
+}
+
+/// The focused sound's Variation page (work-item 35): what the Jam's RANDOMIZER shows
+/// and sets. `mode` is 0 Humanize or 1 Random; the distributions are 0 Equal, 1 Gauss,
+/// 2 ½ Gauss, 3 Fixed; `keyboard` says whether the pads are in a keyboard layout, which
+/// shows Note Range and Chords (pad mode hides them).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct VariationView {
+    pub mode: i64,
+    pub velocity_lo: i64,
+    pub velocity_hi: i64,
+    /// Per cent of a grid step, 0–50.
+    pub time_shift: f64,
+    /// Per cent, 10–100.
+    pub probability: i64,
+    pub note_lo: i64,
+    pub note_hi: i64,
+    pub note_count: i64,
+    /// A note's length in grid steps, 1–6.
+    pub steps: f64,
+    pub dist_note_count: i64,
+    pub dist_notes: i64,
+    pub dist_note_length: i64,
+    /// The generator's Euclidean settings, which `Euclid` (mode 2) shows.
+    pub euclid_steps: i64,
+    pub fills: i64,
+    pub rotate: i64,
+    /// Its Division, as `layout::channel::DIVISIONS` lists it (0 Grid … 10 Fit Bar).
+    pub division: i64,
+    pub keyboard: bool,
 }
 
 /// The app's Control area: what the eight knobs turn.
@@ -751,6 +805,14 @@ pub enum Action {
     Volume(f64),
     /// The master level in dB (at most +10).
     VolumeDb(f64),
+    /// Set one of the focused sound's Variation settings (work-item 35): `field` as the
+    /// page names it (`mode`, `velocity_lo`, …, `dist_notes`), `value` as it shows it.
+    Variation {
+        field: &'static str,
+        value: f64,
+    },
+    /// The Variation page's Apply: vary the focused sound's notes in the focused pattern.
+    ApplyVariation,
     FocusGroup(usize),
     /// Focus sound `.0` of the focused group.
     FocusSound(usize),
@@ -1063,6 +1125,12 @@ pub enum Action {
         group: usize,
         pattern: usize,
     },
+    /// Sound `sound` of group `group` (both from 0): its Audio plug-in's loop switched on
+    /// or off in the pattern the group plays.
+    ToggleAudioLoop {
+        group: usize,
+        sound: usize,
+    },
     /// Group `group`'s pattern `to` becomes a copy of its pattern `from`; past the last, a
     /// new pattern goes there.
     CopyPattern {
@@ -1132,6 +1200,39 @@ pub enum Action {
     SettingsWanted(bool),
 }
 
+/// One OSO slot as the Jam script publishes it (`deckard.oso`): what the strip draws,
+/// and nothing else. `value` is the display text, `sub` the transcribed third-row
+/// sub-label (`None` where the reference leaves the row blank), `group` the spanning
+/// header (`None` where the reference shows none). Holes are `None` in the page's
+/// `slots`. The script's own key for the parameter (`RootNote`) stays in the script: no
+/// host code looks a slot up by name, and a required field nobody reads only failed
+/// scripts that had a slot the host ignored.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OsoSlot {
+    pub value: String,
+    pub sub: Option<String>,
+    pub group: Option<String>,
+}
+
+/// The Jam script's focused OSO page (`deckard.oso`): the title without its counter,
+/// the 1-based `page` and total `pages` for the `n/N` counter, the page-scoped slots
+/// (`None` is a hole), and the script's own cursor — `focus`, a 0-based page slot with
+/// holes counted, and whether it is being changed (`editing`).
+///
+/// The cursor is the script's on every page, menu or tab: the strip draws it and routes
+/// the ENCODER to the script, which owns the press and the turn alike. A viewer-side
+/// cursor existed once and drifted from the script's (three places kept a copy and the
+/// underline sat on a slot the encoder was not on). Stored so the viewer reads it
+/// without Lua.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OsoPage {
+    pub title: String,
+    pub page: usize,
+    pub pages: usize,
+    pub slots: Vec<Option<OsoSlot>>,
+    pub focus: usize,
+    pub editing: bool,
+}
 /// Where the pads play.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PadSetup {
@@ -1144,7 +1245,6 @@ pub struct PadSetup {
     /// Pad mode: the focused sound plays with one fixed velocity per pad.
     pub velocities: Option<[i64; 16]>,
 }
-
 /// The page shown when the scripts start.
 pub const FIRST_PAGE: &str = "control";
 
@@ -1173,6 +1273,8 @@ pub(crate) struct Shared {
     pub leds: Leds,
     pub pinned: BTreeSet<String>,
     pub shown_pin: Option<(String, String)>,
+    /// The Jam script's focused OSO page, as `deckard.oso` last published it.
+    pub oso: Option<OsoPage>,
 }
 
 impl Shared {
@@ -1261,6 +1363,36 @@ impl Surface {
         if !self.load() {
             self.theme = old;
         }
+    }
+
+    /// Load the current theme again, even when its name did not change. Saving over
+    /// the theme that is already showing would otherwise leave the old colours up.
+    pub fn reload_theme(&mut self) -> bool {
+        self.load()
+    }
+
+    /// A named colour of the theme that is showing, if that theme set one.
+    pub fn rgb(&self, name: &str) -> Option<[u8; 3]> {
+        self.run.as_ref()?.lua.app_data_ref::<screen::ThemeCache>()?.rgb(name)
+    }
+
+    /// Paint `look` onto the theme that is showing, and drop the last picture so the
+    /// screens take the new colours on the next draw. Nothing is written to disk.
+    pub fn apply_look(&mut self, look: theme_file::Look) -> bool {
+        let Some(run) = &self.run else { return false };
+        let lua = &run.lua;
+        let Ok(theme) = lua.named_registry_value::<Table>("deckard.theme") else { return false };
+        let Ok(colors) = theme.get::<Table>("colors") else { return false };
+        for (name, rgb) in theme_file::painted(&look) {
+            let Ok(t) = rgb_table(lua, rgb) else { return false };
+            if colors.set(name, t).is_err() {
+                return false;
+            }
+        }
+        let Ok(cache) = screen::ThemeCache::from_theme(&theme) else { return false };
+        lua.set_app_data(cache);
+        self.last_ops = None;
+        true
     }
 
     /// The LCD's colour. Reloads when that theme is the one showing, so the screens
@@ -1563,10 +1695,8 @@ impl Surface {
                 self.call_global(run, "knob_turned", ());
                 self.dispatch(run, "knob", (k + 1, amount));
             }
-            Event::Wheel(steps) => {
-                if !self.call_global(run, "wheel_mode", steps) {
-                    self.dispatch(run, "wheel", steps);
-                }
+            Event::Wheel(steps) if !self.call_global(run, "wheel_mode", steps) => {
+                self.dispatch(run, "wheel", steps);
             }
             // (Fingers from 1; "down", "move" or "up".)
             Event::Touch(finger, kind, pos) => {
@@ -1787,7 +1917,7 @@ impl Surface {
                     colors.set(k, run.lua.create_sequence_from(c)?)?;
                 }
             }
-            let (field, ink, accent) = match run.lua.app_data_ref::<screen::ThemeCache>() {
+            let (field, text, accent) = match run.lua.app_data_ref::<screen::ThemeCache>() {
                 Some(cache) => (cache.background, cache.text, cache.accent),
                 None => {
                     let colors: Table = theme.get("colors")?;
@@ -1798,6 +1928,11 @@ impl Surface {
                     )
                 }
             };
+            // Plug-in pictures take the accent on their orange knobs and sit on the
+            // field. Their light pixels stay white or black with that field: the Text
+            // colour is for labels, not for the picture. The LCD theme is the exception,
+            // because its one ink is the only colour that reads on its paper.
+            let ink = plug_picture_ink(&self.theme, field, text);
             let mut pic = screen::Picture::new(field);
             pic.restyle_plugs = true;
             pic.plug_field = field;
@@ -1883,6 +2018,15 @@ fn merge(lua: &Lua, base: &Table, over: &Table, deep: bool) -> mlua::Result<Valu
         out.set(k, v)?;
     }
     Ok(Value::Table(out))
+}
+
+/// The light parts of a plug-in picture. Not the theme's text colour.
+pub(crate) fn plug_picture_ink(theme: &str, field: [u8; 3], text: [u8; 3]) -> [u8; 3] {
+    if theme == "lcd" {
+        return text;
+    }
+    let light = u16::from(field[0]) * 3 + u16::from(field[1]) * 6 + u16::from(field[2]);
+    if light > 1400 { [0, 0, 0] } else { [255, 255, 255] }
 }
 
 /// `{r, g, b}` as a Lua array (1-based), which `themes/lcd.lua` mixes.
@@ -1973,6 +2117,7 @@ fn start(
         leds: leds::blank(),
         pinned,
         shown_pin,
+        oso: None,
     }));
     api::install(&lua, &shared)?;
     sources::install_require(&lua, sources.clone())?;

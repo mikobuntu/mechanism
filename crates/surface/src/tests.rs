@@ -173,6 +173,70 @@ fn shift_and_erase_show_the_groups() {
     assert_eq!(groups(&s, &v), before, "with ERASE: the groups");
 }
 
+/// A sound whose Audio plug-in is in Loop mode (it plays with the pattern, not with
+/// notes): in Pad mode its pad switches the loop on or off, and focuses it as any pad.
+#[test]
+fn a_loop_mode_sounds_pad_toggles_its_loop() {
+    let (mut s, mut v) = (Surface::new(), view());
+    v.groups[v.group].sounds[2].loop_mode = true;
+    let now = Instant::now();
+    let a = s.event(&Event::PadOn(3, 0.8), &v, now);
+    assert_eq!(a, [Action::ToggleAudioLoop { group: v.group, sound: 2 }, Action::FocusSound(2)]);
+    s.event(&Event::PadOff(3), &v, now);
+    assert_eq!(s.event(&Event::PadOn(2, 0.8), &v, now), [Action::FocusSound(1)], "other sounds just focus");
+    hold(&mut s, &v, "BUTTON_TRANSPORT_ERASE", true);
+    assert!(!s.event(&Event::PadOn(3, 0.8), &v, now).iter().any(|a| matches!(a, Action::ToggleAudioLoop { .. })), "not with ERASE");
+}
+
+#[test]
+fn a_playing_loops_pad_stays_bright() {
+    let (mut s, mut v) = (Surface::new(), view());
+    let now = Instant::now();
+    s.event(&Event::Button("BUTTON_PAD_MODE", true), &v, now);
+    s.event(&Event::Button("BUTTON_PAD_MODE", false), &v, now);
+    assert_eq!(s.page(), "pad_mode");
+
+    let pad3_tile_px = |s: &mut Surface, v: &View| {
+        let mut px = Vec::new();
+        s.draw_picture(v).rasterize_into(&mut px);
+        // Pad 3 is bottom row (row 0), col 2: x = 484 + 2 * 119 = 722, y = 213.
+        px[235 * 960 + 760]
+    };
+    let off_px = pad3_tile_px(&mut s, &v);
+    assert_eq!(s.leds(&v).get("LED_PAD_3"), Some(deckard_mk3::leds::palette(0, 2)), "unfocused and idle: dim");
+
+    // Active loop in Pad mode: holds the full white-mixed highlight (state 5) and fills its screen tile,
+    // both during the press and after releasing the pad.
+    v.groups[v.group].sounds[2].loop_mode = true;
+    v.groups[v.group].sounds[2].loop_playing = true;
+    s.event(&Event::PadOn(3, 0.8), &v, now);
+    assert_eq!(s.leds(&v).get("LED_PAD_3"), Some(deckard_mk3::leds::palette(0, 5)), "held while loop active: full highlight");
+    s.event(&Event::PadOff(3), &v, now);
+    assert_eq!(s.leds(&v).get("LED_PAD_3"), Some(deckard_mk3::leds::palette(0, 5)), "released while loop active: stays at full highlight");
+    let on_px = pad3_tile_px(&mut s, &v);
+    assert_ne!(on_px, off_px, "Pad Mode screen tile is filled while loop is active");
+
+    // Switching the loop off drops the white-mixed flash cleanly, even while `playing` is still true from the press.
+    v.sound = 2;
+    v.groups[v.group].sounds[2].loop_playing = false;
+    v.groups[v.group].sounds[2].playing = true;
+    assert_eq!(
+        s.leds(&v).get("LED_PAD_3"),
+        Some(deckard_mk3::leds::palette(0, 4)),
+        "loop switched off on focused pad: solid bright, no white flash"
+    );
+    v.sound = 0;
+    v.groups[v.group].sounds[2].playing = false;
+    assert_eq!(s.leds(&v).get("LED_PAD_3"), Some(deckard_mk3::leds::palette(0, 2)), "unfocused and off: dim again");
+
+    // MUTE held still shows muted state.
+    v.groups[v.group].sounds[2].loop_playing = true;
+    v.groups[v.group].sounds[2].muted = true;
+    hold(&mut s, &v, "BUTTON_MUTE", true);
+    assert_eq!(s.leds(&v).get("LED_PAD_3"), Some(deckard_mk3::leds::palette(0, 2)), "MUTE held still shows muted");
+    hold(&mut s, &v, "BUTTON_MUTE", false);
+}
+
 #[test]
 fn pads_focus_their_sound() {
     let (mut s, v) = (Surface::new(), view());
@@ -619,7 +683,7 @@ fn an_edit_of_the_same_size_reloads() {
 #[test]
 fn themes_switch() {
     let (mut s, v) = (Surface::new(), view());
-    assert_eq!(s.themes(), ["deep", "lcd", "maschine", "palenight", "palenight_blue_green", "solarized_dark"]);
+    assert_eq!(s.themes(), shipped_themes());
     assert_eq!(s.theme(), "maschine");
     let (_, maschine) = s.screens(&v).unwrap();
     s.set_theme("solarized_dark");
@@ -649,7 +713,60 @@ fn a_users_theme_is_listed() {
     std::fs::create_dir_all(dir.join("themes")).unwrap();
     std::fs::write(dir.join("themes/mine.lua"), crate::SHIPPED.iter().find(|(p, _)| *p == "themes/maschine.lua").unwrap().1).unwrap();
     let s = Surface::with_user_dir(Some(dir.clone()));
-    assert_eq!(s.themes(), ["deep", "lcd", "maschine", "mine", "palenight", "palenight_blue_green", "solarized_dark"]);
+    let mut names = shipped_themes();
+    names.push("mine".into());
+    names.sort();
+    assert_eq!(s.themes(), names);
+}
+
+/// The hand-written themes plus the palettes the editor ships, in the order the
+/// combo lists them.
+fn shipped_themes() -> Vec<String> {
+    let mut names =
+        vec!["deep".into(), "lcd".into(), "maschine".into(), "palenight".into(), "palenight_blue_green".into(), "solarized_dark".into()];
+    names.extend(crate::theme_file::stock().iter().map(|t| t.id.to_string()));
+    names.sort();
+    names
+}
+
+#[test]
+fn a_plug_in_picture_does_not_take_the_text_colour() {
+    assert_eq!(crate::plug_picture_ink("nord", [10, 12, 16], [255, 0, 0]), [255, 255, 255]);
+    assert_eq!(crate::plug_picture_ink("nord", [230, 230, 230], [255, 0, 0]), [0, 0, 0]);
+    assert_eq!(crate::plug_picture_ink("lcd", [240, 220, 40], [20, 20, 20]), [20, 20, 20]);
+}
+
+#[test]
+fn a_stock_theme_loads() {
+    let (mut s, v) = (Surface::new(), view());
+    s.set_theme("nord");
+    assert_eq!((s.theme(), s.error()), ("nord", None));
+    assert_eq!(s.draw_picture(&v).background, [46, 52, 64]);
+}
+
+#[test]
+fn a_look_recolours_the_screens_before_it_is_saved() {
+    let (mut s, v) = (Surface::new(), view());
+    let look = crate::theme_file::parse(&crate::theme_file::lua(
+        "Try",
+        &crate::theme_file::Look {
+            background: [10, 20, 30],
+            text: [240, 240, 240],
+            weak: [120, 130, 140],
+            accent: [20, 200, 80],
+            record: [220, 40, 40],
+            on_colour: [10, 20, 30],
+            button: [40, 50, 60],
+            button_text: [240, 240, 240],
+            selected: [20, 200, 80],
+            selected_text: [10, 20, 30],
+        },
+    ))
+    .unwrap();
+    assert!(s.apply_look(look));
+    let picture = s.draw_picture(&v);
+    assert_eq!(picture.background, [10, 20, 30]);
+    assert_eq!(s.rgb("accent"), Some([20, 200, 80]));
 }
 
 #[test]
@@ -913,8 +1030,7 @@ fn every_theme_draws_every_page() {
     }
 }
 
-/// A note running past the pattern editor's end is cut off at its edge, not drawn on
-/// over the right screen (C16).
+/// A note running past the pattern editor's end stays inside the editor (C16).
 #[test]
 fn long_notes_stay_in_the_pattern_editor() {
     let (mut s, mut v) = (Surface::new(), view());
@@ -933,11 +1049,15 @@ fn long_notes_stay_in_the_pattern_editor() {
     };
     v.notes = vec![note(1920)];
     let cut = s.picture(&v);
+    v.notes = vec![note(2400)];
+    let tail = s.picture(&v);
+    let changed_x: Vec<_> = cut.iter().zip(&tail).enumerate().filter(|(_, (a, b))| a != b).map(|(i, _)| i % 960).collect();
+    assert!(!changed_x.is_empty(), "the continuation appears at the start");
+    assert!(changed_x.iter().all(|&x| x < 120), "only the first quarter of the left screen changes");
     v.notes = vec![note(30_000)];
     let long = s.picture(&v);
     let right = |px: &[[u8; 4]]| px.chunks(960).flat_map(|row| row[480..].to_vec()).collect::<Vec<_>>();
     assert!(right(&cut) == right(&long), "the right screen is the same");
-    assert!(cut == long, "and the left");
 }
 
 /// Held from Keyboard mode, PATTERN shows the Pattern page's buttons, not the
