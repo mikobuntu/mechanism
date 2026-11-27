@@ -223,9 +223,17 @@ function browse.button(name, down)
     focus = next_focus(b, -1)
   elseif name == "WHEEL_RIGHT" then
     focus = next_focus(b, 1)
-  elseif name == "WHEEL_UP" or name == "LEFT" then
+  elseif name == "LEFT" or name == "RIGHT" then
+    if not shift and overlay_knob and overlay_knob >= 5 and overlay_knob <= 7 then
+      step(b, overlay_knob, name == "RIGHT" and 1 or -1)
+    elseif shift then
+      page_products(b, name == "RIGHT" and 1 or -1)
+    else
+      page_products(b, name == "RIGHT" and 1 or -1)
+    end
+  elseif name == "WHEEL_UP" then
     page_products(b, -1)
-  elseif name == "WHEEL_DOWN" or name == "RIGHT" then
+  elseif name == "WHEEL_DOWN" then
     page_products(b, 1)
   else
     return

@@ -8,6 +8,8 @@ use hidapi::{HidApi, HidDevice};
 pub use crate::Event;
 
 pub const PRODUCT: u16 = 0x1700;
+pub const OLED_WIDTH: usize = 128;
+pub const OLED_HEIGHT: usize = 32;
 
 pub const BUTTONS: &[(usize, &str)] = &[
     (0, "BUTTON_MASCHINE"),
@@ -67,7 +69,7 @@ const LED_BUTTONS: [Option<&str>; 39] = [
     Some("LED_MOD"),
     Some("LED_PERFORM"),
     Some("LED_NOTES"),
-    None,
+    Some("LED_GROUP"),
     Some("LED_AUTO_WRITE"),
     Some("LED_LOCK"),
     Some("LED_NOTE_REPEAT"),
@@ -86,7 +88,7 @@ const LED_BUTTONS: [Option<&str>; 39] = [
     Some("LED_STEP"),
     Some("LED_SCENE"),
     Some("LED_PATTERN"),
-    None,
+    Some("LED_EVENTS"),
     Some("LED_VARIATION"),
     Some("LED_DUPLICATE"),
     Some("LED_SELECT"),
@@ -211,6 +213,69 @@ impl Device {
         }
         self.hid.write(&report).map(|_| ()).map_err(|e| e.to_string())
     }
+
+    /// Send a complete 128x32 monochrome OLED frame. The Mikro expects two
+    /// SSD1306-style page transfers, with wire pixels inverted.
+    pub fn write_oled(&self, pixels: &[u8]) -> Result<(), String> {
+        for transfer in oled_transfers(pixels) {
+            self.hid.write(&transfer).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+}
+
+/// Encode a row-major, MSB-first 1-bit frame into the Mikro's two OLED reports.
+pub fn oled_transfers(pixels: &[u8]) -> [Vec<u8>; 2] {
+    let stride = OLED_WIDTH.div_ceil(8);
+    let mut out = [Vec::with_capacity(265), Vec::with_capacity(265)];
+    for (page_pair, transfer) in out.iter_mut().enumerate() {
+        transfer.extend_from_slice(&[0xe0, 0, 0, (page_pair * 2) as u8, 0, 128, 0, 2, 0]);
+        for page in 0..2 {
+            let y_base = (page_pair * 2 + page) * 8;
+            for x in 0..OLED_WIDTH {
+                let mut column = 0u8;
+                for bit in 0..8 {
+                    let y = y_base + bit;
+                    if pixels.get(y * stride + x / 8).is_some_and(|b| b & (0x80 >> (x % 8)) != 0) {
+                        column |= 1 << bit;
+                    }
+                }
+                transfer.push(!column);
+            }
+        }
+    }
+    out
+}
+
+/// Decode the two wire transfers back into the row-major framebuffer used by
+/// DECKARD. This is useful for protocol tests and offline OLED previews.
+pub fn oled_frame_from_transfers(transfers: &[Vec<u8>]) -> Result<Vec<u8>, String> {
+    if transfers.len() != 2 || transfers.iter().any(|transfer| transfer.len() != 265) {
+        return Err("expected two 265-byte Mikro OLED transfers".into());
+    }
+    let mut frame = vec![0; OLED_WIDTH * OLED_HEIGHT / 8];
+    let stride = OLED_WIDTH / 8;
+    for (transfer_index, transfer) in transfers.iter().enumerate() {
+        if transfer[0] != 0xe0 || &transfer[1..3] != &[0, 0] || &transfer[5..7] != &[128, 0] || &transfer[7..9] != &[2, 0] {
+            return Err("invalid Mikro OLED transfer header".into());
+        }
+        if transfer[3] != (transfer_index * 2) as u8 || transfer[4] != 0 {
+            return Err("invalid Mikro OLED page offset".into());
+        }
+        for page in 0..2 {
+            let y_base = (transfer_index * 2 + page) * 8;
+            for x in 0..OLED_WIDTH {
+                let column = !transfer[9 + page * OLED_WIDTH + x];
+                for bit in 0..8 {
+                    if column & (1 << bit) != 0 {
+                        let y = y_base + bit;
+                        frame[y * stride + x / 8] |= 0x80 >> (x % 8);
+                    }
+                }
+            }
+        }
+    }
+    Ok(frame)
 }
 
 fn mikro_button_led(value: u8) -> u8 {
@@ -251,6 +316,8 @@ mod tests {
     #[test]
     fn maps_full_mk3_led_names_to_mikro_layout() {
         assert_eq!(LED_BUTTONS[22], Some("LED_TRANSPORT_PLAY"));
+        assert_eq!(LED_BUTTONS[32], Some("LED_PATTERN"));
+        assert_eq!(LED_BUTTONS[33], Some("LED_EVENTS"));
         assert_eq!(pad_number(0), 13);
         assert_eq!(pad_number(12), 1);
     }
@@ -262,5 +329,28 @@ mod tests {
         assert_eq!(mikro_button_led(crate::leds::ON), 0x7e);
         assert_eq!(mikro_colour_led(0), 0);
         assert_eq!(mikro_colour_led(1), 0x7e);
+    }
+
+    #[test]
+    fn encodes_oled_pages_with_inverted_vertical_columns() {
+        let mut pixels = vec![0; OLED_WIDTH * OLED_HEIGHT / 8];
+        pixels[0] = 0x80;
+        let transfers = oled_transfers(&pixels);
+        assert_eq!(transfers.len(), 2);
+        assert!(transfers.iter().all(|t| t.len() == 265));
+        assert_eq!(&transfers[0][..9], &[0xe0, 0, 0, 0, 0, 128, 0, 2, 0]);
+        assert_eq!(transfers[0][9], 0xfe);
+        assert_eq!(transfers[0][10], 0xff);
+        assert_eq!(&transfers[1][..9], &[0xe0, 0, 0, 2, 0, 128, 0, 2, 0]);
+    }
+
+    #[test]
+    fn oled_wire_round_trip_preserves_the_frame() {
+        let mut frame = vec![0; OLED_WIDTH * OLED_HEIGHT / 8];
+        frame[0] = 0x80;
+        frame[127 / 8] |= 0x80 >> (127 % 8);
+        frame[(31 * OLED_WIDTH + 64) / 8] |= 0x80 >> (64 % 8);
+        let transfers = oled_transfers(&frame);
+        assert_eq!(oled_frame_from_transfers(&transfers).unwrap(), frame);
     }
 }

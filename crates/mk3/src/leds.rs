@@ -223,11 +223,12 @@ pub fn palette_rgb(r: u8, g: u8, b: u8) -> u8 {
 pub struct Leds {
     pub buttons: [u8; 63],
     pub pads: [u8; 42],
+    pub group: u8,
 }
 
 impl Default for Leds {
     fn default() -> Leds {
-        let mut l = Leds { buttons: [0; 63], pads: [0; 42] };
+        let mut l = Leds { buttons: [0; 63], pads: [0; 42], group: 0 };
         l.buttons[0] = 0x80;
         l.pads[0] = 0x81;
         l
@@ -237,7 +238,9 @@ impl Default for Leds {
 impl Leds {
     /// Set an LED by name (its byte: brightness or palette, see [`is_colour`]).
     pub fn set(&mut self, name: &str, byte: u8) -> bool {
-        if let Some(i) = BUTTON_LEDS.iter().position(|n| *n == name) {
+        if name == "LED_GROUP" {
+            self.group = byte;
+        } else if let Some(i) = BUTTON_LEDS.iter().position(|n| *n == name) {
             self.buttons[1 + i] = byte;
         } else if let Some(i) = PAD_LEDS.iter().position(|n| *n == name) {
             self.pads[1 + i] = byte;
@@ -249,7 +252,9 @@ impl Leds {
 
     /// An LED's byte by name.
     pub fn get(&self, name: &str) -> Option<u8> {
-        if let Some(i) = BUTTON_LEDS.iter().position(|n| *n == name) {
+        if name == "LED_GROUP" {
+            Some(self.group)
+        } else if let Some(i) = BUTTON_LEDS.iter().position(|n| *n == name) {
             Some(self.buttons[1 + i])
         } else {
             PAD_LEDS.iter().position(|n| *n == name).map(|i| self.pads[1 + i])

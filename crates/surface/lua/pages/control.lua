@@ -28,6 +28,7 @@ local touch = require("lib.touch")
 local control = {}
 
 local PAGE_GROUPS = { "INPUT", "OUTPUT", "GROOVE", "MACRO" }
+local PERFORM_MODES = { "Filter", "Flanger", "Burst Echo", "Reso Echo", "Ring", "Stutter", "Tremolo", "Scratcher" }
 
 -- The focused slot's place, the "+" being the one after the last.
 local function slot_at(c)
@@ -103,7 +104,13 @@ function control.button(name, down)
     shift_button(c, n)
     return true
   end
-  if name == "LEFT" then
+  local slot = c.slot_index and c.chain[c.slot_index]
+  local perform = c.plugins and slot and slot.name == "Perform FX" and s.groups[s.group] and s.groups[s.group].perform
+  if perform and not deckard.held("SHIFT") and (name == "LEFT" or name == "RIGHT") then
+    local direction = name == "RIGHT" and 1 or -1
+    local mode = ((perform.mode - 1 + direction) % #PERFORM_MODES) + 1
+    deckard.perform_mode(s.group, mode)
+  elseif name == "LEFT" then
     deckard.previous_page()
   elseif name == "RIGHT" then
     deckard.next_page()

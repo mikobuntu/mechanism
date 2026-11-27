@@ -29,6 +29,12 @@ pub fn scale_names(bank: i64) -> &'static [&'static str; 15] {
     &t::SCALES[bank.clamp(0, 7) as usize]
 }
 
+pub fn chord_type_name(s: &ScaleState) -> &'static str {
+    let mut copy = *s;
+    let index = (*chord_type(&mut copy)).max(0) as usize;
+    list(s, "CurrentChordType").and_then(|lists| lists.0.get(index).copied()).unwrap_or("-")
+}
+
 /// Whether `note` is in scale `scale` of bank `bank` played from `root` (every note is
 /// in Main's Chromatic).
 pub fn in_scale(bank: i64, scale: i64, root: i64, note: i64) -> bool {

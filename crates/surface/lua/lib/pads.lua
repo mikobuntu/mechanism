@@ -18,6 +18,7 @@ local pads = {
   -- Focus (PAD MODE's second page): a pad's hit focuses its sound ("On Trigger"), or
   -- the focused sound stays ("Pinned").
   focus_pinned = false,
+  velocity_16 = false,
   -- User Chord Edit mode (USER CHD): Keyboard mode's pads add their notes to the user
   -- chord picked (`user_slot`, 1–12, in the set `chord_types.user`), or take them out;
   -- the octave and semitone buttons move the pads (`view`, semitones) and not the root.
@@ -31,6 +32,18 @@ local pads = {
   grid = false,
   before_grid = nil,
 }
+
+function pads.toggle_velocity_16()
+  pads.velocity_16 = not pads.velocity_16
+end
+
+function pads.velocity_16_values()
+  if not pads.velocity_16 or pads.mode ~= "pad" then return nil end
+  local values = {}
+  for i = 1, 16 do values[i] = i * 8 end
+  values[16] = 127
+  return values
+end
 
 -- The page each mode shows.
 local MODE_PAGES = { pad = "pad_mode", keyboard = "keyboard", chords = "keyboard", step = "step" }

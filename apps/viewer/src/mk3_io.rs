@@ -20,6 +20,8 @@ pub struct PadRoute {
     pub keys: Option<(usize, [i64; 16])>,
     /// Chords mode: the keys' sound plays each pad's chord instead (128: none).
     pub chords: Option<[[i64; 16]; 16]>,
+    /// Pad mode's 16 Velocities values, by pad.
+    pub velocities: Option<[i64; 16]>,
     /// Fixed Velocity: every hit plays at this velocity, however hard.
     pub velocity: Option<i64>,
     /// Velocity scaling, -3 (Soft 3) … 3 (Hard 3) (see [`pad_velocity`]). The pad
@@ -121,7 +123,10 @@ pub struct Touching {
 impl Touching {
     /// The velocity a hit plays at: in the pressure modes the song's Fixed Velocity;
     /// else the pads' Fixed Velocity if on, or the hit's own (`from_pressure`).
-    pub fn hit_velocity(route: &PadRoute, group: usize, sound: usize, from_pressure: i64) -> i64 {
+    pub fn hit_velocity(route: &PadRoute, pad: usize, group: usize, sound: usize, from_pressure: i64) -> i64 {
+        if let Some(velocity) = pad.checked_sub(1).and_then(|i| route.velocities.as_ref()?.get(i)) {
+            return *velocity;
+        }
         match route.touch(group, sound).map(|t| t.mode) {
             Some(TouchMode::PolyAt | TouchMode::Aftertouch | TouchMode::Cc) => route.fixed.clamp(1, 127),
             _ => route.velocity.unwrap_or(from_pressure),
@@ -221,6 +226,46 @@ pub enum ScreenFrame {
 }
 
 impl ScreenFrame {
+    pub fn oled_text(&self) -> Option<String> {
+        let ScreenFrame::Picture(picture) = self else { return None };
+        let mut usable = picture.texts.iter().filter_map(|text| {
+            let text = text.trim();
+            (!text.is_empty()).then_some(text)
+        });
+        usable
+            .find(|text| text.starts_with("ROOT ") || *text == "GROUP SELECT")
+            .or_else(|| {
+                picture.texts.iter().rev().map(String::as_str).map(str::trim).find(|text| {
+                    matches!(
+                        *text,
+                        "BROWSER"
+                            | "PROJECTS"
+                            | "FAVORITES"
+                            | "PATTERN"
+                            | "SCENE"
+                            | "STEP"
+                            | "KEYBOARD"
+                            | "CHORDS"
+                            | "PAD MODE"
+                            | "SONG"
+                            | "EVENTS"
+                            | "CONTROL"
+                            | "MIXER"
+                            | "MODULE"
+                            | "GRID"
+                            | "MOD MATRIX"
+                            | "SAMPLING"
+                            | "TUNER"
+                            | "AUDIO"
+                            | "LOADING"
+                            | "PLAYING"
+                            | "SAVED"
+                    )
+                })
+            })
+            .map(str::to_owned)
+    }
+
     #[cfg(test)]
     pub fn into_pixels(self) -> Vec<[u8; 4]> {
         let mut out = Vec::new();
@@ -294,6 +339,12 @@ struct Shared {
     displays_closed: bool,
     /// The MIDI Monitor, shown what the pads play.
     monitor: Option<crate::midi_monitor::Monitor>,
+    mikro: bool,
+    /// Semantic text intended for the Mikro OLED. This is deliberately separate
+    /// from `screens`, which is the full 960x272 MK3 display frame.
+    oled_status: Option<(u64, String)>,
+    oled_seq: u64,
+    oled_status_expiry: Option<Instant>,
 }
 
 pub struct Mk3Io {
@@ -328,6 +379,13 @@ impl Controller {
         }
     }
 
+    fn poll(&mut self, timeout_ms: i32, events: &mut Vec<Event>) -> Result<(), String> {
+        match self {
+            Self::Mk3(device) => device.poll(timeout_ms, events),
+            Self::Mikro(device) => device.poll(timeout_ms, events),
+        }
+    }
+
     fn write_leds(&self, leds: &deckard_mk3::leds::Leds) -> Result<(), String> {
         match self {
             Self::Mk3(device) => device.write_leds(leds),
@@ -335,10 +393,24 @@ impl Controller {
         }
     }
 
-    fn poll(&mut self, timeout_ms: i32, events: &mut Vec<Event>) -> Result<(), String> {
+    fn set_display_brightness(&self, level: u8) -> Result<(), String> {
         match self {
-            Self::Mk3(device) => device.poll(timeout_ms, events),
-            Self::Mikro(device) => device.poll(timeout_ms, events),
+            Self::Mk3(device) => device.set_display_brightness(level),
+            Self::Mikro(_) => Ok(()),
+        }
+    }
+
+    fn set_led_brightness(&self, level: u8) -> Result<(), String> {
+        match self {
+            Self::Mk3(device) => device.set_led_brightness(level),
+            Self::Mikro(_) => Ok(()),
+        }
+    }
+
+    fn set_pad_sensitivity(&self, level: u8) -> Result<(), String> {
+        match self {
+            Self::Mk3(device) => device.set_pad_sensitivity(level),
+            Self::Mikro(_) => Ok(()),
         }
     }
 }
@@ -487,6 +559,25 @@ impl Mk3Io {
         }
     }
 
+    /// Set semantic text for the Mikro OLED without passing the full MK3
+    /// 960x272 display frame through the OLED worker.
+    pub fn set_oled_status(&self, text: Option<String>) {
+        let mut s = self.shared.lock().unwrap();
+        if let Some(text) = text {
+            if text == "KEYBOARD" && s.oled_status.as_ref().is_some_and(|(_, current)| current.starts_with("KEYBOARD\n")) {
+                return;
+            }
+            s.oled_seq = s.oled_seq.wrapping_add(1);
+            s.oled_status = Some((s.oled_seq, text));
+            s.oled_status_expiry = if s.oled_status.as_ref().is_some_and(|(_, text)| !text.contains('\n')) {
+                Some(Instant::now() + Duration::from_secs(2))
+            } else {
+                None
+            };
+            self.display_wake.notify_one();
+        }
+    }
+
     /// What the controller did since the last call.
     pub fn take_events(&self) -> Vec<Event> {
         std::mem::take(&mut self.shared.lock().unwrap().events)
@@ -564,11 +655,13 @@ fn run(shared: &Mutex<Shared>) {
             continue;
         }
         let _polling = crate::controller_timing::Polling::start();
+        let is_mikro = matches!(dev, Controller::Mikro(_));
         {
             let mut s = shared.lock().unwrap();
             s.status = format!("{} connected", dev.name());
             s.connected = true;
             s.probed = true;
+            s.mikro = is_mikro;
         }
         let mut events = Vec::new();
         // Shown on the LEDs: none yet, so the first state is sent.
@@ -602,6 +695,13 @@ fn run(shared: &Mutex<Shared>) {
                 s.connected = false;
                 break;
             }
+            if let Some(status) = events.iter().find_map(oled_event_status) {
+                let mut s = shared.lock().unwrap();
+                s.oled_seq = s.oled_seq.wrapping_add(1);
+                s.oled_status = Some((s.oled_seq, status));
+                s.oled_status_expiry = Some(Instant::now() + Duration::from_secs(2));
+                self_repaint(&mut s);
+            }
             // Dispatch arrived pad/button events immediately before any LED/feature writes.
             if !events.is_empty() {
                 let mut s = shared.lock().unwrap();
@@ -610,6 +710,7 @@ fn run(shared: &Mutex<Shared>) {
                     group: 0,
                     keys: None,
                     chords: None,
+                    velocities: None,
                     velocity: None,
                     scaling: 0,
                     fixed: 100,
@@ -673,7 +774,7 @@ fn run(shared: &Mutex<Shared>) {
                     let notes = pad_notes(&route, pad);
                     let Some(&(sound, pitch)) = notes.first() else { continue };
                     let group = route.group;
-                    let velocity = Touching::hit_velocity(&route, group, sound, from_pressure);
+                    let velocity = Touching::hit_velocity(&route, pad, group, sound, from_pressure);
                     match &out {
                         Some(o) => {
                             // Held until the pad is let go (Note Repeat / the Arp take held notes).
@@ -776,7 +877,7 @@ fn run(shared: &Mutex<Shared>) {
                 shown = leds;
             }
         }
-        std::thread::sleep(Duration::from_secs(1));
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -786,6 +887,50 @@ fn set_agent_holding(s: &mut Shared, holding: bool) {
         if let Some(ctx) = &s.repaint {
             ctx.request_repaint();
         }
+    }
+}
+
+fn oled_event_status(event: &Event) -> Option<String> {
+    match *event {
+        Event::Button(name, true) => Some(match name {
+            "BUTTON_BROWSE" => "BROWSER".to_owned(),
+            "BUTTON_FAVORITES" => "FAVORITES".to_owned(),
+            "BUTTON_FILE" => "PROJECTS".to_owned(),
+            "BUTTON_PATTERN" => "PATTERN".to_owned(),
+            "BUTTON_SCENE" => "SCENE".to_owned(),
+            "BUTTON_STEP" => "STEP".to_owned(),
+            "BUTTON_CHORDS" => "CHORDS".to_owned(),
+            "BUTTON_PAD_MODE" => "PAD MODE".to_owned(),
+            "BUTTON_EVENTS" => "EVENTS".to_owned(),
+            "BUTTON_MIX" => "MIXER".to_owned(),
+            "BUTTON_SAMPLE" => "SAMPLING".to_owned(),
+            "BUTTON_SETTINGS" => "SETTINGS".to_owned(),
+            "BUTTON_KEYBOARD" => "KEYBOARD".to_owned(),
+            "BUTTON_PLUGIN" => "PLUGIN".to_owned(),
+            "BUTTON_NOTES" => "NOTES".to_owned(),
+            "BUTTON_PERFORM" => "PERFORM".to_owned(),
+            "BUTTON_VOLUME" => "VOLUME".to_owned(),
+            "BUTTON_SWING" => "SWING".to_owned(),
+            "BUTTON_TEMPO" => "TEMPO".to_owned(),
+            "BUTTON_NOTE_REPEAT" => "NOTE REPEAT".to_owned(),
+            "BUTTON_FIX_VELOCITY" => "FIX VELOCITY".to_owned(),
+            "BUTTON_WHEEL" => "WHEEL PUSH".to_owned(),
+            _ if name.starts_with("BUTTON_") => name.trim_start_matches("BUTTON_").replace('_', " ").to_uppercase(),
+            _ => return None,
+        }),
+        Event::Wheel(steps) => Some(format!("WHEEL {steps:+}")),
+        Event::Knob(index, amount) => Some(format!("KNOB {} {amount:+.2}", index + 1)),
+        Event::Touch(_, kind, position) => Some(format!("SLIDER {kind} {:>3}%", (position * 100.0).round() as i32)),
+        Event::PadOn(pad, pressure) => Some(format!("PAD {pad} {:>3}%", (pressure * 100.0).round() as i32)),
+        Event::PadOff(pad) => Some(format!("PAD {pad} OFF")),
+        Event::PadPressure(pad, pressure) => Some(format!("PAD {pad} {:>3}%", (pressure * 100.0).round() as i32)),
+        _ => None,
+    }
+}
+
+fn self_repaint(s: &mut Shared) {
+    if let Some(ctx) = &s.repaint {
+        ctx.request_repaint();
     }
 }
 
@@ -801,6 +946,23 @@ fn run_displays(shared: &Mutex<Shared>, wake: &std::sync::Condvar) {
     let mut right = vec![0u16; WIDTH * HEIGHT];
     let mut px: Vec<[u8; 4]> = Vec::with_capacity(WIDTH * 2 * HEIGHT);
     let mut last_px: Vec<[u8; 4]> = Vec::with_capacity(WIDTH * 2 * HEIGHT);
+    loop {
+        let (closing, mikro) = {
+            let s = shared.lock().unwrap();
+            (s.closing, s.mikro)
+        };
+        if closing {
+            return;
+        }
+        if mikro {
+            run_mikro_oled(shared, wake);
+            return;
+        }
+        if shared.lock().unwrap().probed {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
     // Fill `out` with one 480×272 half of a 960-wide RGBA picture, dithered to the
     // displays' 5-6-5 levels (the one place the picture loses its low bits).
     let fill_half = |px: &[[u8; 4]], x0: usize, out: &mut [u16]| {
@@ -976,6 +1138,235 @@ fn run_displays(shared: &Mutex<Shared>, wake: &std::sync::Condvar) {
 }
 
 #[cfg(test)]
+fn mono_oled_frame(px: &[[u8; 4]]) -> Vec<u8> {
+    use deckard_mk3::mikro::{OLED_HEIGHT, OLED_WIDTH};
+    let mut out = vec![0; OLED_WIDTH * OLED_HEIGHT / 8];
+    // The Mikro cannot show both full MK3 panels. Use the upper 480x40
+    // status band of the left panel, where the controller overlays live,
+    // instead of shrinking the entire 960x272 canvas into unreadable noise.
+    let src_w = deckard_mk3::display::WIDTH;
+    let src_h = 40;
+    let stride = src_w * 2;
+    let lit = |x: usize, y: usize| {
+        let [r, g, b, a] = px.get(y * stride + x).copied().unwrap_or([0, 0, 0, 255]);
+        a != 0 && (u16::from(r) * 3 + u16::from(g) * 6 + u16::from(b)) >= 500
+    };
+    let mut bounds = [src_w, src_h, 0, 0];
+    for y in 0..src_h {
+        for x in 0..src_w {
+            if lit(x, y) {
+                bounds[0] = bounds[0].min(x);
+                bounds[1] = bounds[1].min(y);
+                bounds[2] = bounds[2].max(x + 1);
+                bounds[3] = bounds[3].max(y + 1);
+            }
+        }
+    }
+    if bounds[0] >= bounds[2] || bounds[1] >= bounds[3] {
+        return out;
+    }
+    let margin = 2;
+    let dst_w = OLED_WIDTH - margin * 2;
+    let dst_h = OLED_HEIGHT - margin * 2;
+    let content_w = bounds[2] - bounds[0];
+    let content_h = bounds[3] - bounds[1];
+    for y in margin..OLED_HEIGHT - margin {
+        let y0 = bounds[1] + (y - margin) * content_h / dst_h;
+        let y1 = (bounds[1] + ((y - margin + 1) * content_h).div_ceil(dst_h)).min(bounds[3]);
+        for x in margin..OLED_WIDTH - margin {
+            let x0 = bounds[0] + (x - margin) * content_w / dst_w;
+            let x1 = (bounds[0] + ((x - margin + 1) * content_w).div_ceil(dst_w)).min(bounds[2]);
+            if (y0..y1.max(y0 + 1)).any(|sy| (x0..x1.max(x0 + 1)).any(|sx| lit(sx, sy))) {
+                out[y * (OLED_WIDTH / 8) + x / 8] |= 0x80 >> (x % 8);
+            }
+        }
+    }
+    out
+}
+
+fn oled_glyph(ch: char) -> [u8; 7] {
+    match ch {
+        'A' => [0x0e, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11],
+        'B' => [0x1e, 0x11, 0x11, 0x1e, 0x11, 0x11, 0x1e],
+        'C' => [0x0f, 0x10, 0x10, 0x10, 0x10, 0x10, 0x0f],
+        'D' => [0x1e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1e],
+        'E' => [0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x1f],
+        'F' => [0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x10],
+        'G' => [0x0f, 0x10, 0x10, 0x17, 0x11, 0x11, 0x0f],
+        'H' => [0x11, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11],
+        'I' => [0x0e, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0e],
+        'J' => [0x01, 0x01, 0x01, 0x01, 0x11, 0x11, 0x0e],
+        'K' => [0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11],
+        'L' => [0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1f],
+        'M' => [0x11, 0x1b, 0x15, 0x15, 0x11, 0x11, 0x11],
+        'N' => [0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11],
+        'O' => [0x0e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e],
+        'P' => [0x1e, 0x11, 0x11, 0x1e, 0x10, 0x10, 0x10],
+        'Q' => [0x0e, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0d],
+        'R' => [0x1e, 0x11, 0x11, 0x1e, 0x14, 0x12, 0x11],
+        'S' => [0x0f, 0x10, 0x10, 0x0e, 0x01, 0x01, 0x1e],
+        'T' => [0x1f, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
+        'U' => [0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e],
+        'V' => [0x11, 0x11, 0x11, 0x11, 0x11, 0x0a, 0x04],
+        'W' => [0x11, 0x11, 0x11, 0x15, 0x15, 0x1b, 0x11],
+        'X' => [0x11, 0x11, 0x0a, 0x04, 0x0a, 0x11, 0x11],
+        'Y' => [0x11, 0x11, 0x0a, 0x04, 0x04, 0x04, 0x04],
+        'Z' => [0x1f, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1f],
+        '-' => [0x00, 0x00, 0x00, 0x1f, 0x00, 0x00, 0x00],
+        '.' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x06],
+        ':' => [0x00, 0x06, 0x06, 0x00, 0x06, 0x06, 0x00],
+        '/' => [0x01, 0x02, 0x02, 0x04, 0x08, 0x08, 0x10],
+        '#' => [0x0a, 0x1f, 0x0a, 0x0a, 0x1f, 0x0a, 0x00],
+        ' ' => [0; 7],
+        '0' => [0x0e, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0e],
+        '1' => [0x04, 0x0c, 0x04, 0x04, 0x04, 0x04, 0x0e],
+        '2' => [0x0e, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1f],
+        '3' => [0x1e, 0x01, 0x01, 0x0e, 0x01, 0x01, 0x1e],
+        '4' => [0x02, 0x06, 0x0a, 0x12, 0x1f, 0x02, 0x02],
+        '5' => [0x1f, 0x10, 0x10, 0x1e, 0x01, 0x01, 0x1e],
+        '6' => [0x0e, 0x10, 0x10, 0x1e, 0x11, 0x11, 0x0e],
+        '7' => [0x1f, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08],
+        '8' => [0x0e, 0x11, 0x11, 0x0e, 0x11, 0x11, 0x0e],
+        '9' => [0x0e, 0x11, 0x11, 0x0f, 0x01, 0x01, 0x0e],
+        _ => [0; 7],
+    }
+}
+
+fn oled_text_frame(text: &str, offset: usize) -> Vec<u8> {
+    use deckard_mk3::mikro::{OLED_HEIGHT, OLED_WIDTH};
+    let scale = 2;
+    let advance = 13;
+    let mut out = vec![0; OLED_WIDTH * OLED_HEIGHT / 8];
+    let lines: Vec<Vec<char>> = text.to_ascii_uppercase().split('\n').map(|line| line.chars().collect()).collect();
+    for (line_index, chars) in lines.iter().take(2).enumerate() {
+        let width = chars.len() * advance;
+        let first = if lines.len() == 1 && width > OLED_WIDTH { offset.min(width - OLED_WIDTH) } else { 0 };
+        let left = if width < OLED_WIDTH { (OLED_WIDTH - width) / 2 } else { 0 };
+        let top = if lines.len() == 1 { 1 } else { 0 };
+        let top = top + line_index * 16;
+        for (i, ch) in chars.iter().enumerate() {
+            for (row, bits) in oled_glyph(*ch).into_iter().enumerate() {
+                for col in 0..5 {
+                    if bits & (1 << (4 - col)) == 0 {
+                        continue;
+                    }
+                    for dy in 0..scale {
+                        for dx in 0..scale {
+                            let x = left + i * advance + col * scale + dx;
+                            let y = top + row * scale + dy;
+                            if x >= first && x - first < OLED_WIDTH && y < OLED_HEIGHT {
+                                let x = x - first;
+                                out[y * (OLED_WIDTH / 8) + x / 8] |= 0x80 >> (x % 8);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn oled_text_width(text: &str) -> usize {
+    text.lines().map(|line| line.chars().count() * 13).max().unwrap_or(0)
+}
+
+fn run_mikro_oled(shared: &Mutex<Shared>, wake: &std::sync::Condvar) {
+    let device = loop {
+        match deckard_mk3::mikro::Device::open() {
+            Ok(device) => break device,
+            Err(e) => {
+                shared.lock().unwrap().display_status = e;
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+    };
+    let standby = oled_text_frame("MASCHINE MIKRO", 0);
+    if let Err(e) = device.write_oled(&standby) {
+        shared.lock().unwrap().display_status = e;
+        return;
+    }
+    let mut shown = None;
+    let mut text: Option<String> = Some("MASCHINE MIKRO".to_owned());
+    let mut offset = 0;
+    let mut next_scroll = Instant::now() + Duration::from_millis(900);
+    loop {
+        let (closing, frame, timed_out) = {
+            let mut s = shared.lock().unwrap();
+            loop {
+                if s.closing {
+                    break (true, None, false);
+                }
+                if s.oled_status_expiry.is_some_and(|expiry| Instant::now() >= expiry) {
+                    s.oled_seq = s.oled_seq.wrapping_add(1);
+                    s.oled_status = None;
+                    s.oled_status_expiry = None;
+                    break (false, Some((s.oled_seq, String::new())), false);
+                }
+                if let Some((n, status)) = &s.oled_status
+                    && shown != Some(*n)
+                {
+                    break (false, Some((*n, status.clone())), false);
+                }
+                if text.as_ref().is_some_and(|text| oled_text_width(text) > deckard_mk3::mikro::OLED_WIDTH) && Instant::now() >= next_scroll
+                {
+                    break (false, None, true);
+                }
+                let wait = next_scroll.saturating_duration_since(Instant::now()).min(Duration::from_millis(250));
+                let (guard, result) = wake.wait_timeout(s, wait).unwrap();
+                s = guard;
+                if result.timed_out() {
+                    break (false, None, true);
+                }
+            }
+        };
+        if closing {
+            let black = vec![0; deckard_mk3::mikro::OLED_WIDTH * deckard_mk3::mikro::OLED_HEIGHT / 8];
+            let _ = device.write_oled(&black);
+            shared.lock().unwrap().displays_closed = true;
+            return;
+        }
+        if timed_out {
+            if let Some(current) = &text {
+                let width = oled_text_width(current);
+                let end = width.saturating_sub(deckard_mk3::mikro::OLED_WIDTH);
+                offset = if offset >= end { 0 } else { (offset + 13).min(end) };
+                if offset == 0 || offset == end {
+                    next_scroll = Instant::now() + Duration::from_millis(900);
+                } else {
+                    next_scroll = Instant::now() + Duration::from_millis(180);
+                }
+                if let Err(e) = device.write_oled(&oled_text_frame(current, offset)) {
+                    shared.lock().unwrap().display_status = e;
+                    return;
+                }
+            }
+            continue;
+        }
+        if let Some((n, new_text)) = frame {
+            if new_text.is_empty() {
+                text = None;
+                shown = Some(n);
+                let black = vec![0; deckard_mk3::mikro::OLED_WIDTH * deckard_mk3::mikro::OLED_HEIGHT / 8];
+                let _ = device.write_oled(&black);
+                continue;
+            }
+            offset = 0;
+            next_scroll = Instant::now() + Duration::from_millis(900);
+            text = Some(new_text.clone());
+            let mono = oled_text_frame(&new_text, offset);
+            shown = Some(n);
+            if let Err(e) = device.write_oled(&mono) {
+                shared.lock().unwrap().display_status = e;
+                shared.lock().unwrap().displays_connected = false;
+                return;
+            }
+            shared.lock().unwrap().displays_connected = true;
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use deckard_model::pad_touch::{PadTouch, TouchMode};
@@ -1014,10 +1405,40 @@ mod tests {
         assert!(px.iter().all(|p| *p == [0, 0, 0, 255]), "every pixel is black");
     }
 
+    #[test]
+    fn mono_oled_frame_downsamples_lit_pixels() {
+        let width = deckard_mk3::display::WIDTH * 2;
+        let height = deckard_mk3::display::HEIGHT;
+        let black = vec![[0, 0, 0, 255]; width * height];
+        let white = vec![[255, 255, 255, 255]; width * height];
+        assert_eq!(mono_oled_frame(&black), vec![0; 128 * 32 / 8]);
+        let white = mono_oled_frame(&white);
+        assert!(white.iter().filter(|byte| **byte != 0).count() > 300);
+    }
+
+    #[test]
+    fn mono_oled_frame_ignores_transparent_pixels() {
+        let width = deckard_mk3::display::WIDTH * 2;
+        let height = deckard_mk3::display::HEIGHT;
+        let mut pixels = vec![[255, 255, 255, 0]; width * height];
+        pixels[0] = [255, 255, 255, 255];
+        let frame = mono_oled_frame(&pixels);
+        assert_eq!(frame.len(), 128 * 32 / 8);
+        assert!(frame.iter().any(|byte| *byte != 0));
+    }
+
+    #[test]
+    fn oled_text_frame_renders_large_glyphs() {
+        let frame = oled_text_frame("ROOT C4", 0);
+        assert_eq!(frame.len(), 128 * 32 / 8);
+        assert!(frame.iter().filter(|byte| **byte != 0).count() > 20);
+        assert!(frame[0..16].iter().all(|byte| *byte == 0));
+    }
+
     fn route(touch: PadTouch) -> PadRoute {
         let mut touches = [PadTouch::default(); 16];
         touches[0] = touch;
-        PadRoute { play: true, group: 0, keys: None, chords: None, velocity: None, scaling: 0, fixed: 90, touches }
+        PadRoute { play: true, group: 0, keys: None, chords: None, velocities: None, velocity: None, scaling: 0, fixed: 90, touches }
     }
 
     fn mode(mode: TouchMode) -> PadTouch {
@@ -1086,12 +1507,15 @@ mod tests {
     #[test]
     fn pressure_modes_hit_at_fixed_velocity() {
         for m in [TouchMode::PolyAt, TouchMode::Aftertouch, TouchMode::Cc] {
-            assert_eq!(Touching::hit_velocity(&route(mode(m)), 0, 0, 30), 90, "{m:?}");
+            assert_eq!(Touching::hit_velocity(&route(mode(m)), 1, 0, 0, 30), 90, "{m:?}");
         }
-        assert_eq!(Touching::hit_velocity(&route(mode(TouchMode::Velocity)), 0, 0, 30), 30);
+        assert_eq!(Touching::hit_velocity(&route(mode(TouchMode::Velocity)), 1, 0, 0, 30), 30);
         // The pads' own Fixed Velocity still wins in the Velocity mode.
         let fixed = PadRoute { velocity: Some(110), ..route(PadTouch::default()) };
-        assert_eq!(Touching::hit_velocity(&fixed, 0, 0, 30), 110);
+        assert_eq!(Touching::hit_velocity(&fixed, 1, 0, 0, 30), 110);
+        let sixteen = PadRoute { velocities: Some([11; 16]), ..route(PadTouch::default()) };
+        assert_eq!(Touching::hit_velocity(&sixteen, 1, 0, 0, 30), 11);
+        assert_eq!(Touching::hit_velocity(&sixteen, 16, 0, 0, 30), 11);
     }
 
     /// Aftertouch from two held pads of a sound: the harder one counts; letting go of
@@ -1213,7 +1637,7 @@ mod tests {
     #[test]
     fn pending_hits_keep_their_velocity() {
         let r = route(mode(TouchMode::PolyAt));
-        let fixed = Touching::hit_velocity(&r, 0, 0, 30);
+        let fixed = Touching::hit_velocity(&r, 1, 0, 0, 30);
         let notes = pending_notes(&[(0, 0, 60, fixed), (0, 0, 60, 0), (0, 1, 64, 45)]);
         let on = |sound, pitch, velocity| Live::NoteOn { group: 0, sound, pitch, velocity, length: deckard_model::PPQ };
         assert_eq!(notes, vec![on(0, 60, 90), on(1, 64, 45)]);

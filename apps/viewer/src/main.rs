@@ -1493,6 +1493,69 @@ pub(crate) struct Mk3Out {
     pub leds: deckard_mk3::leds::Leds,
     /// New screens, if they changed: their count and frame to rasterize on the display thread.
     pub screens: Option<(u64, mk3_io::ScreenFrame)>,
+    pub oled_status: Option<String>,
+}
+
+fn root_oled_status(note: i64) -> String {
+    const NAMES: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+    let note = note.clamp(0, 127);
+    format!("ROOT {}{}", NAMES[note as usize % 12], note / 12 - 2)
+}
+
+fn keyboard_oled_status(note: i64) -> String {
+    format!("KEYBOARD\n{}", root_oled_status(note))
+}
+
+fn chords_oled_status(host: &deckard_lua_host::Host) -> String {
+    let state = host.state.borrow().scale;
+    let mode = ["HARMONIZER", "CHORD SET", "USER CHORD"]
+        .get(state.screen_mode.clamp(0, 2) as usize)
+        .copied()
+        .unwrap_or("CHORDS");
+    format!("CHORDS {}\n{}", mode, deckard_lua_host::api::scales::chord_type_name(&state).to_uppercase())
+}
+
+fn browser_oled_status(host: &deckard_lua_host::Host) -> String {
+    const KINDS: [&str; 7] = ["PROJECTS", "GROUPS", "SOUNDS", "INSTRUMENTS", "EFFECTS", "LOOPS", "ONE-SHOTS"];
+    let browser = &host.state.borrow().browser;
+    let tag = browser
+        .attributes
+        .iter()
+        .filter_map(|(values, chosen)| chosen.and_then(|i| values.get(i)))
+        .next()
+        .map(String::as_str)
+        .unwrap_or("ALL TAGS");
+    format!("BROWSER {}\n{}", KINDS.get(browser.kind).copied().unwrap_or("BROWSER"), tag.to_uppercase())
+}
+
+fn perform_oled_status(app: &App, group: usize) -> Option<String> {
+    let doc = app.doc.as_ref()?.borrow();
+    let slot = doc.project().groups.get(group)?.slots.iter().find(|slot| slot.module == deckard_model::PERFORM_FX.0)?;
+    let value = |name: &str| slot.params.iter().find(|(field, _)| field == name).map_or(0.0, |(_, value)| *value);
+    let mode = (value("mode").round().clamp(0.0, 7.0)) as usize;
+    let names = module_ui::PERFORM_MODES;
+    let assignment = match mode {
+        2 => {
+            if value("burst_ts_assign") >= 0.5 {
+                "TIME"
+            } else {
+                "FEED"
+            }
+        }
+        5 => {
+            if value("stutter_ts_assign") >= 0.5 {
+                "PITCH"
+            } else {
+                "LENGTH"
+            }
+        }
+        0 => "FREQ",
+        1 | 3 | 4 => "FREQ",
+        6 | 7 => "POS",
+        _ => "POS",
+    };
+    let engaged = if value("touchstrip_on_off") >= 0.5 { "ON" } else { "OFF" };
+    Some(format!("PERFORM FX\n{} {} {:>3.0}% {}", names[mode].to_uppercase(), assignment, value("touchstrip_pos") * 100.0, engaged))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -5970,7 +6033,11 @@ impl App {
             // Written to the controller only when it changes (and on connecting).
             m.set_pad_sensitivity(self.settings.pad_sensitivity);
             if let Some((n, frame)) = out.screens {
+                let oled = out.oled_status.clone().or_else(|| frame.oled_text());
+                m.set_oled_status(oled);
                 m.set_screens(n, frame);
+            } else {
+                m.set_oled_status(out.oled_status.clone());
             }
         }
         // Pad hits that came while no engine ran (it starts with the first): each at its
@@ -6027,11 +6094,50 @@ impl App {
             t
         };
         let mut mixer_on = None;
+        let mut oled_status = None;
+        let mut perform_activity = false;
         let out = if let Some(Ok(c)) = &mut self.controller {
             for e in events {
                 match e {
                     Event::Button(name, down) => {
                         c.hold(name, down, requests);
+                        if down && matches!(name, "BUTTON_PERFORM" | "BUTTON_SHIFT") {
+                            perform_activity = true;
+                        }
+                        if down && c.host.keyboard_mode() {
+                            let delta = match name {
+                                "BUTTON_SCREEN_5" => Some(-12),
+                                "BUTTON_SCREEN_6" => Some(12),
+                                "BUTTON_SCREEN_7" => Some(-1),
+                                "BUTTON_SCREEN_8" => Some(1),
+                                _ => None,
+                            };
+                            if delta.is_some() {
+                                oled_status = Some(keyboard_oled_status(c.host.keyboard_root()));
+                            }
+                        }
+                        if down {
+                            if let Some(status) = match name {
+                                "BUTTON_BROWSE" => Some("BROWSER"),
+                                "BUTTON_FILE" => Some("PROJECTS"),
+                                "BUTTON_PATTERN" => Some("PATTERN"),
+                                "BUTTON_SCENE" => Some("SCENE"),
+                                "BUTTON_STEP" => Some("STEP"),
+                                "BUTTON_KEYBOARD" => Some("KEYBOARD"),
+                                "BUTTON_CHORDS" => Some("CHORDS"),
+                                "BUTTON_PAD_MODE" => Some("PAD MODE"),
+                                "BUTTON_EVENTS" => Some("EVENTS"),
+                                "BUTTON_MIX" => Some("MIXER"),
+                                "BUTTON_SAMPLE" => Some("SAMPLING"),
+                                "BUTTON_SETTINGS" => Some("SETTINGS"),
+                                _ => None,
+                            } {
+                                oled_status = Some(status.to_owned());
+                            }
+                            if name == "BUTTON_KEYBOARD" {
+                                oled_status = Some(keyboard_oled_status(c.host.keyboard_root()));
+                            }
+                        }
                         // Maschine's own scripts: MIX shows their mixer page. Follow it
                         // in the window. DECKARD's layer does this with MixerView.
                         if down && name == "BUTTON_MIX" {
@@ -6050,10 +6156,22 @@ impl App {
                             let mode = c.host.state.borrow().hw.encoder_mode;
                             eprintln!("knob {}: {inc:+.3} (encoder mode {mode})", k + 1);
                         }
-                        c.encoder(&format!("ENCODER_SCREEN_{}", k + 1), inc, requests)
+                        c.encoder(&format!("ENCODER_SCREEN_{}", k + 1), inc, requests);
                     }
-                    Event::Wheel(steps) => c.wheel(steps, requests),
-                    Event::Touch(f, kind, pos) => c.touch(f, kind, pos, requests),
+                    Event::Wheel(steps) => {
+                        c.wheel(steps, requests);
+                        if c.host.keyboard_mode() {
+                            oled_status = Some(keyboard_oled_status(c.host.keyboard_root()));
+                        } else {
+                            oled_status = Some(format!("WHEEL {steps:+}"));
+                        }
+                    }
+                    Event::Touch(f, kind, pos) => {
+                        if c.host.perform_strip_mode() && f == 0 {
+                            perform_activity = true;
+                        }
+                        c.touch(f, kind, pos, requests);
+                    }
                 }
             }
             // (One at a time: each call borrows the scripts' state.)
@@ -6071,13 +6189,26 @@ impl App {
             }
             let scaling = self.settings.velocity_scaling;
             let pin_changed = c.sync_pins(&mut self.settings.pinned_pages);
-            let route = mk3_io::PadRoute { play, group, keys, chords, velocity, scaling, fixed, touches: touches(self, group) };
+            if c.host.keyboard_mode() {
+                oled_status = Some(if c.host.keyboard_chords().is_some() {
+                    chords_oled_status(&c.host)
+                } else {
+                    keyboard_oled_status(c.host.keyboard_root())
+                });
+            } else if c.host.constant("NI.HW.PAGE_BROWSE").ok().is_some_and(|page| c.host.state.borrow().hw.page_stack.contains(&page)) {
+                oled_status = Some(browser_oled_status(&c.host));
+            }
+            let route =
+                mk3_io::PadRoute { play, group, keys, chords, velocities: None, velocity, scaling, fixed, touches: touches(self, group) };
             if pin_changed {
                 #[cfg(not(test))]
                 self.settings.save();
             }
-            self.control_bridge();
-            Mk3Out { route, leds, screens }
+            if perform_activity || self.slot_of == Some(deckard_doc::Chain::Group(self.group)) && self.slot == self.perform_slot(self.group)
+            {
+                oled_status = perform_oled_status(self, self.group);
+            }
+            Mk3Out { route, leds, screens, oled_status }
         } else {
             // DECKARD's own layer: the user's edited scripts load as they're saved.
             let now = std::time::Instant::now();
@@ -6133,13 +6264,19 @@ impl App {
                 group: self.group,
                 keys: pads.keys,
                 chords: pads.chords,
+                velocities: pads.velocities,
                 velocity: view.fixed_velocity.then_some(fixed.clamp(0, 127)),
                 scaling: self.settings.velocity_scaling,
                 fixed: fixed.clamp(0, 127),
                 touches: touches(self, self.group),
             };
             self.frame_surface_view = Some((self.surface_view_stamp(), view));
-            Mk3Out { route, leds, screens: screens.map(|(n, p)| (n, mk3_io::ScreenFrame::Picture(std::sync::Arc::new(p)))) }
+            Mk3Out {
+                route,
+                leds,
+                screens: screens.map(|(n, p)| (n, mk3_io::ScreenFrame::Picture(std::sync::Arc::new(p)))),
+                oled_status: None,
+            }
         };
         if let Some(on) = mixer_on {
             self.set_mixer(on);

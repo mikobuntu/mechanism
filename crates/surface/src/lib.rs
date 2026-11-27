@@ -1141,6 +1141,8 @@ pub struct PadSetup {
     pub keys: Option<(usize, [i64; 16])>,
     /// Chords mode: every pad plays its chord's notes instead (128: none).
     pub chords: Option<[[i64; 16]; 16]>,
+    /// Pad mode: the focused sound plays with one fixed velocity per pad.
+    pub velocities: Option<[i64; 16]>,
 }
 
 /// The page shown when the scripts start.
@@ -1579,7 +1581,7 @@ impl Surface {
     /// Where the pads play now: the page's `pads()`, else the global one's; with
     /// neither, every pad plays its sound.
     pub fn pads(&self, v: &View) -> PadSetup {
-        let all = PadSetup { play: true, keys: None, chords: None };
+        let all = PadSetup { play: true, keys: None, chords: None, velocities: None };
         let r = self.with(v, None, |run| self.pads_in(run, all));
         r.map_or(all, |(p, _)| p)
     }
@@ -1635,7 +1637,7 @@ impl Surface {
     /// Pads, LEDs and screens together for one view (comparing [`View`] once instead of
     /// three times).
     pub fn outputs(&mut self, v: &View) -> (PadSetup, Leds, Option<(u64, screen::Picture)>) {
-        let all = PadSetup { play: true, keys: None, chords: None };
+        let all = PadSetup { play: true, keys: None, chords: None, velocities: None };
         let Some((pads, leds, p)) =
             self.with(v, None, |run| (self.pads_in(run, all), self.leds_in(run), self.draw_picture_in(run, v))).map(|(res, _)| res)
         else {
@@ -2010,7 +2012,8 @@ fn page_table(lua: &Lua, name: &str) -> mlua::Result<Option<Table>> {
     Ok(Some(t))
 }
 
-/// `{ play = bool, keys = { sound = n, notes = {16 pitches} } }` as a [`PadSetup`].
+/// `{ play = bool, keys = { sound = n, notes = {16 pitches} }, velocities = {16 values} }`
+/// as a [`PadSetup`].
 fn pad_setup(t: &Table) -> mlua::Result<PadSetup> {
     let play = t.get::<Option<bool>>("play")?.unwrap_or(true);
     let keys = match t.get::<Option<Table>>("keys")? {
@@ -2038,7 +2041,17 @@ fn pad_setup(t: &Table) -> mlua::Result<PadSetup> {
         }
         None => None,
     };
-    Ok(PadSetup { play, keys, chords })
+    let velocities = match t.get::<Option<Table>>("velocities")? {
+        Some(values) => {
+            let mut out = [127i64; 16];
+            for (i, velocity) in out.iter_mut().enumerate() {
+                *velocity = values.get::<Option<i64>>(i + 1)?.map_or(127, |v| v.clamp(1, 127));
+            }
+            Some(out)
+        }
+        None => None,
+    };
+    Ok(PadSetup { play, keys, chords, velocities })
 }
 
 #[cfg(test)]

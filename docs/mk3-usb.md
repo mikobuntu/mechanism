@@ -18,6 +18,21 @@ one along: **5 HID**, **6 "BD"** (the displays, bulk OUT 0x04), 7 DFU. Its stora
 (PID 0x1822) is another device. As reported on Windows 11; not yet tested here on the
 hardware. `MODELS` in `crates/mk3/src/lib.rs` has each controller's ids.
 
+### Maschine Mikro MK3 OLED
+
+The Mikro MK3 (`0x17cc:0x1700`) does not expose the full MK3's separate colour-display
+bulk interface. It has one HID control interface, which also carries its 128×32
+monochrome OLED output. OLED writes use report `0xe0` and are sent as two 265-byte
+transfers. Each transfer contains a 9-byte report/header followed by 256 bytes of
+page data: 128 columns for two 8-pixel vertical pages. The page origins are 0 and 2;
+the header fields are little-endian `x=0`, `y_page`, `width=128`, `height_pages=2`.
+
+The wire format is inverted (`0` means lit), and each column byte uses bit 0 for the
+top pixel of its 8-pixel page. DECKARD keeps this path separate from the full MK3
+RGB565 bulk-display driver. The viewer converts the existing 960×272 RGBA screen
+frame to a 128×32 monochrome frame and sends it through the same Mikro HID handle
+that polls input and writes LEDs, avoiding a second HID claim on Linux.
+
 ## Input report 0x01 (42 bytes)
 
 | bytes | |

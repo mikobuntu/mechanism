@@ -311,6 +311,21 @@ fn keyboard_plays_from_c3_and_moves_by_octave() {
 }
 
 #[test]
+fn keyboard_wheel_moves_root_by_semitone_or_octave_with_shift() {
+    let (mut s, v) = (Surface::new(), view());
+    press(&mut s, &v, "BUTTON_KEYBOARD");
+    assert_eq!(s.pads(&v).keys.unwrap().1[0], 60);
+    assert_eq!(s.event(&Event::Wheel(1), &v, Instant::now()), [Action::Scale { root: 61, bank: 0, kind: 0 }]);
+    assert_eq!(s.pads(&v).keys.unwrap().1[0], 61);
+    hold(&mut s, &v, "BUTTON_SHIFT", true);
+    assert_eq!(s.event(&Event::Wheel(-1), &v, Instant::now()), [Action::Scale { root: 49, bank: 0, kind: 0 }]);
+    assert_eq!(s.pads(&v).keys.unwrap().1[0], 49);
+    hold(&mut s, &v, "BUTTON_SHIFT", false);
+    assert_eq!(s.event(&Event::Wheel(100), &v, Instant::now()), [Action::Scale { root: 127 - 15, bank: 0, kind: 0 }]);
+    assert_eq!(s.pads(&v).keys.unwrap().1[0], 112);
+}
+
+#[test]
 fn knobs_turn_the_control_page() {
     let (mut s, v) = (Surface::new(), view());
     let now = Instant::now();
@@ -492,6 +507,18 @@ fn fixed_velocity_toggles() {
     assert_eq!(press(&mut s, &v, "BUTTON_FIX_VELOCITY"), [Action::FixedVelocity(false)]);
 }
 
+#[test]
+fn shift_fixed_velocity_enables_sixteen_velocities_only_in_pad_mode() {
+    let (mut s, v) = (Surface::new(), view());
+    assert!(s.pads(&v).velocities.is_none());
+    hold(&mut s, &v, "BUTTON_SHIFT", true);
+    assert!(press(&mut s, &v, "BUTTON_FIX_VELOCITY").is_empty());
+    hold(&mut s, &v, "BUTTON_SHIFT", false);
+    assert_eq!(s.pads(&v).velocities, Some([8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 127]));
+    press(&mut s, &v, "BUTTON_KEYBOARD");
+    assert!(s.pads(&v).velocities.is_none());
+}
+
 /// A fresh, empty folder for a user's scripts (under the temporary folder), and the
 /// guard that removes it.
 fn user_dir() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -654,10 +681,30 @@ fn library(v: &mut View) {
 #[test]
 fn browse_shows_and_hides_its_page() {
     let (mut s, v) = (Surface::new(), view());
-    press(&mut s, &v, "BUTTON_BROWSE");
+    assert_eq!(press(&mut s, &v, "BUTTON_BROWSE"), [Action::Library(true)]);
     assert_eq!(s.page(), "browse");
-    press(&mut s, &v, "BUTTON_BROWSE");
+    assert_eq!(press(&mut s, &v, "BUTTON_BROWSE"), [Action::Library(false)]);
     assert_eq!(s.page(), "control", "pressed again, the page it was pressed on");
+}
+
+#[test]
+fn project_button_opens_recent_projects_and_favorites_filters_browser() {
+    let (mut s, mut v) = (Surface::new(), view());
+    assert_eq!(press(&mut s, &v, "BUTTON_MASCHINE"), [Action::Browse(Browse::Kind(0))]);
+    assert_eq!(s.page(), "browse");
+    assert!(s.event(&Event::Wheel(1), &v, Instant::now()).is_empty());
+
+    library(&mut v);
+    assert_eq!(press(&mut s, &v, "BUTTON_FAVORITES"), [Action::Browse(Browse::Favorites)]);
+    assert_eq!(s.page(), "browse");
+}
+
+#[test]
+fn keyboard_screen_shows_root_note_and_octave() {
+    let (mut s, mut v) = (Surface::new(), view());
+    v.scale_root = 72;
+    press(&mut s, &v, "BUTTON_KEYBOARD");
+    assert!(s.screen_text(&v).iter().any(|text| text == "ROOT C4"));
 }
 
 #[test]
@@ -2513,6 +2560,27 @@ fn shift_and_a_pad_edit_the_pattern() {
     hold(&mut s, &v, "BUTTON_ERASE", true);
     assert_eq!(s.event(&Event::PadOn(2, 0.5), &v, now), [Action::ResetSound(1)]);
     assert_eq!(s.error(), None);
+}
+
+#[test]
+fn group_and_top_pads_focus_groups() {
+    let (mut s, mut v) = (Surface::new(), view());
+    v.groups.extend((1..=8).map(|_| GroupView::default()));
+    hold(&mut s, &v, "BUTTON_GROUP", true);
+    assert_eq!(s.event(&Event::PadOn(9, 0.5), &v, Instant::now()), [Action::FocusGroup(0)]);
+    assert_eq!(s.event(&Event::PadOn(16, 0.5), &v, Instant::now()), [Action::FocusGroup(7)]);
+}
+
+#[test]
+fn shift_group_enters_step_mode() {
+    let (mut s, v) = (Surface::new(), view());
+    hold(&mut s, &v, "BUTTON_SHIFT", true);
+    assert!(press(&mut s, &v, "BUTTON_GROUP").is_empty());
+    assert_eq!(s.page(), "step");
+    hold(&mut s, &v, "BUTTON_SHIFT", false);
+    let now = Instant::now();
+    assert!(s.event(&Event::PadOn(9, 0.8), &v, now).is_empty());
+    assert!(s.event(&Event::PadOff(9), &v, now).is_empty());
 }
 
 #[test]

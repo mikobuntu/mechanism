@@ -4,7 +4,7 @@
 use deckard_mk3::leds::{BUTTON_LEDS, PAD_LEDS};
 
 /// Labels that differ from the driver's names: (label, button, light).
-const RENAMED: [(&str, &str, &str); 7] = [
+const RENAMED: [(&str, &str, &str); 8] = [
     ("PLAY", "BUTTON_TRANSPORT_PLAY", "LED_TRANSPORT_PLAY"),
     ("STOP", "BUTTON_TRANSPORT_STOP", "LED_TRANSPORT_STOP"),
     ("REC", "BUTTON_TRANSPORT_RECORD", "LED_TRANSPORT_RECORD"),
@@ -12,6 +12,7 @@ const RENAMED: [(&str, &str, &str); 7] = [
     ("ERASE", "BUTTON_TRANSPORT_ERASE", "LED_TRANSPORT_ERASE"),
     ("FIXED_VEL", "BUTTON_FIX_VELOCITY", "LED_FIX_VELOCITY"),
     ("AUTO", "BUTTON_AUTO", "LED_AUTO_WRITE"),
+    ("GROUP", "BUTTON_GROUP", "LED_GROUP"),
 ];
 
 /// A button's label, from the driver's name (`BUTTON_TRANSPORT_PLAY` → `PLAY`).
@@ -34,7 +35,7 @@ pub fn light(label: &str) -> Option<String> {
     } else {
         format!("LED_{label}")
     };
-    (BUTTON_LEDS.contains(&name.as_str()) || PAD_LEDS.contains(&name.as_str())).then_some(name)
+    (name == "LED_GROUP" || BUTTON_LEDS.contains(&name.as_str()) || PAD_LEDS.contains(&name.as_str())).then_some(name)
 }
 
 #[cfg(test)]

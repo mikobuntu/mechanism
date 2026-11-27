@@ -518,6 +518,13 @@ impl Host {
         (root, s.bank, s.scale)
     }
 
+    /// The root currently used by the Keyboard/Chords pad layout. This is
+    /// separate from the focused group's stored root: the controller scripts
+    /// move `lib.pads.base` when the 4-D wheel changes the keyboard root.
+    pub fn keyboard_root(&self) -> i64 {
+        self.lua.load("local pads = require('lib.pads'); return pads.base or 60").eval().unwrap_or(60)
+    }
+
     /// Set that scale (as the Keyboard page's knobs do).
     pub fn set_scale(&mut self, root: i64, bank: i64, scale: i64) {
         {
@@ -660,6 +667,15 @@ impl Host {
             }
         }
         self.event("onTouchEvent", (id, kind, value));
+    }
+
+    /// Whether the Smart Strip is currently in Perform FX mode.
+    pub fn perform_strip_mode(&self) -> bool {
+        let Some(perform) = self.constant("NI.HW.TS_MODE_PERFORM").ok() else { return false };
+        self.lua
+            .load("return NHLController:getContext():getTouchstripModeParameter():getValue()")
+            .eval::<i64>()
+            .is_ok_and(|mode| mode == perform)
     }
 
     /// NOTES mode (native in Maschine): finger `finger` strums the pads held, else all

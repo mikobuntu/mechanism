@@ -84,6 +84,13 @@ function page.button(name, down)
     return true
   end
   if not down then return end
+  if pads.mode == "chords" and shown().at == 1 and deckard.held("CAP_4") and not deckard.held("SHIFT")
+      and (name == "LEFT" or name == "RIGHT") then
+    local list, _, key = pads.chord_list()
+    local direction = name == "RIGHT" and 1 or -1
+    pads.chord_types[key] = ((pads.chord_types[key] - 1 + direction) % #list) + 1
+    return true
+  end
   if paged.button(shown(), name) then return true end
   if name == "SCREEN_4" then
     user_chd()

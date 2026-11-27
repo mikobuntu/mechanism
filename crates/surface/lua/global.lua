@@ -179,7 +179,7 @@ function global.button(name, down)
   elseif name == "FOLLOW" then
     deckard.follow(not s.follow)
   elseif name == "FIXED_VEL" then
-    deckard.fixed_velocity(not s.fixed_velocity)
+    if shift then pads.toggle_velocity_16() else deckard.fixed_velocity(not s.fixed_velocity) end
   elseif name == "PAD_MODE" then
     pad_mode("pad")
   elseif name == "KEYBOARD" then
@@ -188,6 +188,8 @@ function global.button(name, down)
     pad_mode("chords")
   elseif name == "STEP" then
     if shift then pads.toggle_grid() else pad_mode("step") end
+  elseif name == "GROUP" and shift then
+    pad_mode("step")
   elseif name == "CHANNEL" then
     deckard.show_plugins(false)
     deckard.show_page("control")
@@ -238,8 +240,16 @@ function global.button(name, down)
     deckard.show_plugins(false)
     deckard.show_page("control")
     deckard.page_group(4)
+  elseif name == "MASCHINE" then
+    if shift then return end
+    back.over("browse")
+    deckard.browse_kind(1)
+  elseif name == "FAVORITES" then
+    if deckard.page() ~= "browse" then back.over("browse") end
+    deckard.browse_favorites()
   elseif MODE_BUTTONS[name] then
     toggle_page(MODE_BUTTONS[name])
+    if name == "BROWSE" then deckard.library(deckard.page() == "browse") end
   elseif name == "TEMPO" then
     toggle_wheel("tempo")
   elseif name == "SWING" then
@@ -288,6 +298,14 @@ function global.button(name, down)
 end
 
 function global.pad(n, velocity)
+  -- GROUP + pads 9-16 focus the eight Groups in the current bank.
+  if deckard.held("GROUP") and not deckard.held("SHIFT") and n >= 9 then
+    local s = deckard.state()
+    local bank = (s.group - 1) // 8
+    local g = bank * 8 + n - 8
+    if g <= #s.groups then deckard.focus_group(g) elseif g == #s.groups + 1 then deckard.add_group() end
+    return true
+  end
   -- (SELECT, MUTE and SOLO act on a sound, whatever the pads otherwise do.)
   local acting = pin.active("SELECT") or pin.active("MUTE") or pin.active("SOLO")
   if pads.keys() and not acting then return true end
@@ -368,6 +386,10 @@ end
 
 function global.wheel(steps)
   if global.wheel_mode(steps) then return true end
+  if pads.keyboard() then
+    pads.move(steps * (deckard.held("SHIFT") and 12 or 1))
+    return true
+  end
   local s = deckard.state()
   local group = s.groups[s.group]
   if not group or #group.sounds == 0 then return true end
@@ -427,7 +449,11 @@ function global.pads()
   -- (SELECT, MUTE, SOLO and ERASE act on a sound, silently, so it can be edited live.)
   local picking = pin.active("PATTERN") or pin.active("SCENE")
   local acting = pin.active("SELECT") or pin.active("MUTE") or pin.active("SOLO") or deckard.held("ERASE")
-  return { play = pads.mode ~= "step" and not picking and not acting, keys = keys }
+  return {
+    play = pads.mode ~= "step" and not picking and not acting,
+    keys = keys,
+    velocities = pads.velocity_16_values(),
+  }
 end
 
 -- The touch strip's lights.
@@ -470,7 +496,7 @@ function global.leds()
   else
     deckard.led("FOLLOW", lit(s.follow))
   end
-  deckard.led("FIXED_VEL", lit(s.fixed_velocity))
+  deckard.led("FIXED_VEL", lit(s.fixed_velocity or pads.velocity_16))
   deckard.led("PAD_MODE", lit(pads.mode == "pad"))
   deckard.led("KEYBOARD", lit(pads.mode == "keyboard"))
   deckard.led("CHORDS", lit(pads.mode == "chords"))
@@ -501,6 +527,7 @@ function global.leds()
   deckard.led("MIX", lit(page == "mixer"))
   deckard.led("ARRANGE", lit(page == "arrange"))
   deckard.led("BROWSE", lit(page == "browse"))
+  deckard.led("GROUP", deckard.held("GROUP") and "on" or "dim")
 
   -- The Control area stays chosen under the pad modes' pages; LEFT / RIGHT turn its
   -- pages unless a modifier is held.
@@ -588,6 +615,24 @@ function global.leds()
   -- Keyboard mode, the Arp's, the keyboard).
   local group = s.groups[s.group]
   local sounds = group and group.sounds or {}
+  if deckard.held("GROUP") and not deckard.held("SHIFT") then
+    local first = (s.group - 1) // 8 * 8
+    for i = 1, 16 do
+      local g = first + i - 8
+      local selected = i >= 9 and g == s.group
+      local target = i >= 9 and s.groups[g]
+      if i < 9 then
+        deckard.led("PAD_" .. i, "off")
+      elseif target then
+        deckard.led("PAD_" .. i, target.palette, selected)
+      elseif g == #s.groups + 1 then
+        deckard.led("PAD_" .. i, EMPTY_SLOT, false)
+      else
+        deckard.led("PAD_" .. i, "off")
+      end
+    end
+    return
+  end
   -- A note that has just started, sequenced or played, flashes its pad white: a brighter
   -- shade of the pad's own colour hardly shows on a pad that's already bright.
   if pads.keys() then
@@ -621,6 +666,15 @@ function global.leds()
       -- Selected pads are fully lit, the others half lit.
       deckard.led(name, sound.palette, deckard.pad_held(i) or chosen, sound.playing and not deckard.pad_held(i))
     end
+  end
+end
+
+function global.draw(screen, theme)
+  local s = deckard.state()
+  if pads.mode == "keyboard" then
+    screen:label(0, 4, 480, 34, "ROOT " .. pads.note_name(s.scale.root), { size = 22, color = "text" }, "center", "center")
+  elseif deckard.held("GROUP") then
+    screen:label(0, 4, 480, 34, "GROUP SELECT", { size = 22, color = "text" }, "center", "center")
   end
 end
 
